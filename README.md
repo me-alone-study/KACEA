@@ -1,23 +1,19 @@
 # KACEA
 
 1. 创建新环境（推荐 Python 3.9，兼容性最佳）
-# 新建名为"new_ibmea"的环境，指定Python 3.9
-conda create -n new_ibmea python=3.9 -y
-# 激活环境
-conda activate new_ibmea
+conda create -n KACEA python=3.9 -y
+
 2. 配置渠道（确保下载速度和兼容性）
 保留原环境的有效渠道，并补充必要渠道：
-
-# 添加渠道（按优先级排序）
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/Paddle/
 conda config --add channels pytorch
 conda config --set show_channel_urls yes  # 显示渠道来源
-3. 安装核心依赖（PyTorch+CUDA）
+
+4. 安装核心依赖（PyTorch+CUDA）
 CLIP 依赖 PyTorch 和 CUDA，需根据显卡型号选择适配的 CUDA 版本（以下以CUDA 11.7为例，支持大多数新显卡；旧显卡可换为 11.3）：
 
-# 安装CUDA工具包（根据显卡选择：11.7支持RTX 30/40系列，11.3支持GTX 10/20系列）
 conda install cudatoolkit=11.7 -y
 
 # 安装PyTorch和配套库（对应CUDA 11.7的最新兼容版本）
@@ -28,7 +24,7 @@ conda install cudatoolkit=11.7 -y
 4. 安装 CLIP 及关键依赖
 CLIP 需要直接从源码安装（或用 pip 安装），同时需补充其他依赖：
 
-# 安装CLIP（OpenAI官方版本）
+# 安装CLIP
 pip install git+https://github.com/openai/CLIP.git
 
 # 安装CLIP依赖的辅助库（处理图像/文本）
@@ -60,6 +56,8 @@ from PIL import Image
 # 加载CLIP模型（会自动下载，约1.8GB）
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model, preprocess = clip.load("ViT-B/32", device=device)
+
+# 下载DBP15K和mmkg数据
 
 # 测试文本-图像匹配
 image = preprocess(Image.open("test.jpg")).unsqueeze(0).to(device)  # 替换为任意图像路径
