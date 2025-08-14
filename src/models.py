@@ -72,7 +72,6 @@ class SimpleGAT(nn.Module):
         for i, layer in enumerate(self.layers):
             # 对于大图，使用简化的处理
             if x.size(0) > 20000:
-                # 简化版本：只做线性变换和邻接矩阵乘法
                 x = self.simple_forward(x, adj, layer)
             else:
                 x = layer(x, adj)
@@ -86,7 +85,6 @@ class SimpleGAT(nn.Module):
     
     def simple_forward(self, x, adj, layer):
         """简化的前向传播，避免内存爆炸"""
-        # 使用第一个头的权重
         w = layer.w[0] if layer.diag else layer.w[0]
         
         if layer.diag:
@@ -94,7 +92,6 @@ class SimpleGAT(nn.Module):
         else:
             h = torch.mm(x, w)
         
-        # 简单的图卷积
         if adj.is_sparse:
             output = torch.sparse.mm(adj, h)
         else:
@@ -103,8 +100,66 @@ class SimpleGAT(nn.Module):
         return output
 
 
-class IBMultiModal(nn.Module):
-    """修复的IBMEA多模态模型"""
+class CLIPFusionLayer(nn.Module):
+    """CLIP特征融合层"""
+    
+    def __init__(self, img_dim, text_dim, fusion_dim, fusion_strategy="concat"):
+        super(CLIPFusionLayer, self).__init__()
+        self.fusion_strategy = fusion_strategy
+        self.img_dim = img_dim
+        self.text_dim = text_dim
+        self.fusion_dim = fusion_dim
+        
+        if fusion_strategy == "concat":
+            self.fusion_fc = nn.Linear(img_dim + text_dim, fusion_dim)
+        elif fusion_strategy == "attention":
+            self.attention = nn.MultiheadAttention(embed_dim=img_dim, num_heads=8)
+            self.fusion_fc = nn.Linear(img_dim, fusion_dim)
+        elif fusion_strategy == "gate":
+            self.gate_img = nn.Linear(img_dim, img_dim)
+            self.gate_text = nn.Linear(text_dim, text_dim)
+            self.fusion_fc = nn.Linear(img_dim + text_dim, fusion_dim)
+        elif fusion_strategy == "add":
+            assert img_dim == text_dim, "For add fusion, img_dim must equal text_dim"
+            self.fusion_fc = nn.Linear(img_dim, fusion_dim)
+        
+    def forward(self, img_features, text_features):
+        if img_features is None or text_features is None:
+            if img_features is not None:
+                return self.fusion_fc(img_features)
+            elif text_features is not None:
+                return self.fusion_fc(text_features)
+            else:
+                return None
+        
+        if self.fusion_strategy == "concat":
+            fused = torch.cat([img_features, text_features], dim=-1)
+            return self.fusion_fc(fused)
+            
+        elif self.fusion_strategy == "attention":
+            # 使用注意力机制融合
+            img_features = img_features.unsqueeze(1)  # [B, 1, D]
+            text_features = text_features.unsqueeze(1)  # [B, 1, D]
+            attn_output, _ = self.attention(img_features, text_features, text_features)
+            return self.fusion_fc(attn_output.squeeze(1))
+            
+        elif self.fusion_strategy == "gate":
+            # 使用门控机制融合
+            gate_img = torch.sigmoid(self.gate_img(img_features))
+            gate_text = torch.sigmoid(self.gate_text(text_features))
+            gated_img = gate_img * img_features
+            gated_text = gate_text * text_features
+            fused = torch.cat([gated_img, gated_text], dim=-1)
+            return self.fusion_fc(fused)
+            
+        elif self.fusion_strategy == "add":
+            # 简单相加融合
+            fused = img_features + text_features
+            return self.fusion_fc(fused)
+
+
+class KAMultiModal(nn.Module):
+    """修复的IBMEA多模态模型，支持CLIP"""
     
     def __init__(
         self,
@@ -114,7 +169,7 @@ class IBMultiModal(nn.Module):
         char_feature_dim=None,
         use_project_head=False,
     ):
-        super(IBMultiModal, self).__init__()
+        super(KAMultiModal, self).__init__()
 
         self.args = args
         attr_dim = self.args.attr_dim
@@ -143,6 +198,25 @@ class IBMultiModal(nn.Module):
             char_feature_dim = 100
         self.name_fc = nn.Linear(300, char_dim)
         self.char_fc = nn.Linear(char_feature_dim, char_dim)
+
+        # CLIP相关组件
+        self.use_clip = getattr(args, 'use_clip', False)
+        if self.use_clip:
+            # CLIP特征融合层
+            self.clip_fusion = CLIPFusionLayer(
+                img_dim=img_dim,
+                text_dim=img_dim,  # 假设文本特征维度与图像特征相同
+                fusion_dim=img_dim,
+                fusion_strategy=getattr(args, 'clip_fusion_strategy', 'concat')
+            )
+            
+            # CLIP变分编码器（如果启用）
+            if getattr(args, 'use_clip_vib', False):
+                self.clip_fc_mu = nn.Linear(img_dim, img_dim)
+                self.clip_fc_std = nn.Linear(img_dim, img_dim)
+                self.use_clip_vib = True
+            else:
+                self.use_clip_vib = False
 
         # 变分信息瓶颈相关
         self.use_graph_vib = getattr(args, 'use_graph_vib', False)
@@ -225,7 +299,6 @@ class IBMultiModal(nn.Module):
                 with_weight=getattr(args, 'with_weight', 1)
             )
         else:
-            # 简化版本的融合
             self.fusion = SimpleFusion(total_dim)
 
         # 投影头
@@ -248,6 +321,7 @@ class IBMultiModal(nn.Module):
         self.rel_kld_loss = 0
         self.attr_kld_loss = 0
         self.joint_kld_loss = 0
+        self.clip_kld_loss = 0
 
     def _kld_gauss(self, mu_1, logsigma_1, mu_2, logsigma_2):
         """KL散度计算"""
@@ -268,7 +342,7 @@ class IBMultiModal(nn.Module):
             q_context = Normal(mu_2, sigma_2)
             
             kl = kl_divergence(q_target, q_context).mean(dim=0).sum()
-            return torch.clamp(kl, 0, 100)  # 限制KL散度的范围
+            return torch.clamp(kl, 0, 100)
         except:
             # 简化版本的KL散度
             kl = 0.5 * (logsigma_2 - logsigma_1 - 1.0 + 
@@ -307,7 +381,6 @@ class IBMultiModal(nn.Module):
                 embeddings.append(gph_emb)
             except Exception as e:
                 print(f"Warning: Graph encoding failed: {e}")
-                # 使用简单的实体嵌入作为fallback
                 gph_emb = self.entity_emb(input_idx)
                 embeddings.append(gph_emb)
 
@@ -315,8 +388,34 @@ class IBMultiModal(nn.Module):
         img_emb = None
         if self.args.w_img and img_features is not None:
             try:
+                # 基础图像特征处理
+                img_emb = self.img_fc(img_features)
+                
+                # CLIP特征融合（如果启用）
+                if self.use_clip and hasattr(self, 'clip_fusion') and entity_names is not None:
+                    # 处理CLIP文本特征
+                    text_emb = self.img_fc(entity_names)  # 将文本特征投影到相同维度
+                    
+                    # 融合CLIP图像和文本特征
+                    clip_fused = self.clip_fusion(img_emb, text_emb)
+                    
+                    # CLIP变分处理
+                    if self.use_clip_vib:
+                        clip_h = F.relu(clip_fused)
+                        clip_mu = self.clip_fc_mu(clip_h)
+                        clip_logvar = self.clip_fc_std(clip_h)
+                        clip_std = torch.exp(0.5 * clip_logvar)
+                        clip_eps = torch.randn_like(clip_std)
+                        clip_fused = clip_mu + clip_eps * clip_std
+                        self.clip_kld_loss = self._kld_gauss(
+                            clip_mu, clip_std, torch.zeros_like(clip_mu), torch.ones_like(clip_std)
+                        )
+                    
+                    # 将CLIP融合特征与原始图像特征结合
+                    img_emb = (img_emb + clip_fused) / 2  # 简单平均融合
+                
+                # 图像特征的变分处理
                 if self.use_img_vib:
-                    img_emb = self.img_fc(img_features)
                     img_emb_h = F.relu(img_emb)
                     mu = self.img_fc_mu(img_emb_h)
                     logvar = self.img_fc_std(img_emb_h)
@@ -326,8 +425,7 @@ class IBMultiModal(nn.Module):
                     self.img_kld_loss = self._kld_gauss(
                         mu, std, torch.zeros_like(mu), torch.ones_like(std)
                     )
-                else:
-                    img_emb = self.img_fc(img_features)
+                
                 embeddings.append(img_emb)
             except Exception as e:
                 print(f"Warning: Image encoding failed: {e}")
@@ -434,6 +532,7 @@ class IBMultiModal(nn.Module):
 
 
 class MultiModalFusion(nn.Module):
+    """多模态融合模块"""
     def __init__(self, modal_num=6, with_weight=1):
         super(MultiModalFusion, self).__init__()
         self.modal_num = modal_num
@@ -465,6 +564,7 @@ class MultiModalFusion(nn.Module):
 
 
 class SimpleFusion(nn.Module):
+    """简单融合模块"""
     def __init__(self, total_dim):
         super(SimpleFusion, self).__init__()
         self.total_dim = total_dim
@@ -478,4 +578,4 @@ class SimpleFusion(nn.Module):
 
 
 # 为了保持兼容性，设置别名
-ClipEnhancedIBMEA = IBMultiModal
+ClipEnhancedKACEA = KAMultiModal

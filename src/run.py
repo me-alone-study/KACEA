@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import gc
+import json
+from datetime import datetime
 from pprint import pprint
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -29,6 +31,15 @@ except:
     from src.models import *
     from src.Load import *
     from src.loss import *
+
+# CLIP相关导入
+try:
+    from transformers import CLIPModel, CLIPTokenizer, CLIPProcessor
+    CLIP_AVAILABLE = True
+except ImportError:
+    print("Warning: transformers not available, CLIP features disabled")
+    CLIPModel = CLIPTokenizer = CLIPProcessor = None
+    CLIP_AVAILABLE = False
 
 
 def load_img_features(ent_num, file_dir, triples, use_mean_img=False):
@@ -96,7 +107,7 @@ def load_img_features_dropout(
     return img_features
 
 
-class IBMEA:
+class KACEA:
 
     def __init__(self):
         self.ent2id_dict = None
@@ -125,6 +136,15 @@ class IBMEA:
         self.test_left = None
         self.test_right = None
         self.multimodal_encoder = None
+        
+        # CLIP相关属性
+        self.clip_model = None
+        self.clip_tokenizer = None
+        self.clip_processor = None
+        self.entity_names = None
+        self.entity_text_features = None
+        self.clip_img_features = None
+        
         self.weight_raw = None
         self.rel_fc = None
         self.att_fc = None
@@ -150,6 +170,11 @@ class IBMEA:
         self.device = torch.device(
             "cuda" if self.args.cuda and torch.cuda.is_available() else "cpu"
         )
+        
+        # 初始化日志系统
+        self.log_dir, self.log_file = self.setup_logging()
+        self.exp_results = []
+        
         self.init_data()
         self.init_model()
         self.print_summary()
@@ -157,6 +182,43 @@ class IBMEA:
         self.best_epoch = 0
         self.best_data_list = []
         self.best_to_write = []
+
+    def setup_logging(self):
+        """设置日志目录和文件"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dataset = os.path.basename(self.args.file_dir)
+        
+        exp_name = f"{dataset}_{timestamp}"
+        if hasattr(self.args, 'use_clip') and self.args.use_clip:
+            exp_name += "_clip"
+        if hasattr(self.args, 'use_entity_names') and self.args.use_entity_names:
+            exp_name += "_names"
+        if hasattr(self.args, 'clip_fine_tune') and self.args.clip_fine_tune:
+            exp_name += "_ft"
+            
+        # 创建logs文件夹（与src同级）
+        logs_dir = "logs"
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        log_dir = os.path.join(logs_dir, exp_name)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_file = os.path.join(log_dir, "training.log")
+        
+        # 保存配置
+        config = {k: v for k, v in vars(self.args).items() if isinstance(v, (str, int, float, bool))}
+        with open(os.path.join(log_dir, "config.json"), 'w') as f:
+            json.dump(config, f, indent=2)
+            
+        return log_dir, log_file
+
+    def log_print(self, message, print_console=True):
+        """统一的日志输出函数"""
+        if print_console:
+            print(message)
+        
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
 
     @staticmethod
     def parse_options(parser):
@@ -542,18 +604,14 @@ class IBMEA:
             torch.cuda.manual_seed(seed)
 
     def print_summary(self):
-        print("-----dataset summary-----")
-        print("dataset:\t", self.args.file_dir)
-        print("triple num:\t", len(self.triples))
-        print("entity num:\t", self.ENT_NUM)
-        print("relation num:\t", self.REL_NUM)
-        print(
-            "train ill num:\t",
-            self.train_ill.shape[0],
-            "\ttest ill num:\t",
-            self.test_ill.shape[0],
-        )
-        print("-------------------------")
+        summary_msg = f"""-----dataset summary-----
+dataset:\t{self.args.file_dir}
+triple num:\t{len(self.triples)}
+entity num:\t{self.ENT_NUM}
+relation num:\t{self.REL_NUM}
+train ill num:\t{self.train_ill.shape[0]}\ttest ill num:\t{self.test_ill.shape[0]}
+-------------------------"""
+        self.log_print(summary_msg)
 
     def init_data(self):
         # Load data
@@ -571,7 +629,7 @@ class IBMEA:
 
         self.ENT_NUM = len(self.ent2id_dict)
         self.REL_NUM = len(self.r_hs)
-        print("total ent num: {}, rel num: {}".format(self.ENT_NUM, self.REL_NUM))
+        self.log_print(f"total ent num: {self.ENT_NUM}, rel num: {self.REL_NUM}")
 
         np.random.shuffle(self.ills)
 
@@ -589,35 +647,35 @@ class IBMEA:
                 self.ENT_NUM, file_dir, self.triples, self.args.use_mean_img
             )
         self.img_features = F.normalize(torch.Tensor(self.img_features).to(device))
-        print("image feature shape:", self.img_features.shape)
+        self.log_print(f"image feature shape: {self.img_features.shape}")
         
         # === 重要修复：初始化name_features和char_features ===
         self.name_features = None
         self.char_features = None
         
-        # 只有在明确启用时才尝试加载这些特征
+        # 只有在明确可用时才尝试加载这些特征
         if hasattr(self.args, 'w_name') and self.args.w_name:
             try:
                 # 尝试加载name特征的具体实现
                 # 这里需要根据实际数据格式实现
-                print("Loading name features...")
+                self.log_print("Loading name features...")
                 # 暂时使用随机特征作为placeholder
                 self.name_features = torch.randn(self.ENT_NUM, 300).to(device)
-                print("name feature shape:", self.name_features.shape)
+                self.log_print(f"name feature shape: {self.name_features.shape}")
             except Exception as e:
-                print(f"Warning: Failed to load name features: {e}")
+                self.log_print(f"Warning: Failed to load name features: {e}")
                 self.name_features = None
                 # 如果加载失败，禁用name特征
                 self.args.w_name = False
         
         if hasattr(self.args, 'w_char') and self.args.w_char:
             try:
-                print("Loading char features...")
+                self.log_print("Loading char features...")
                 # 暂时使用随机特征作为placeholder  
                 self.char_features = torch.randn(self.ENT_NUM, 100).to(device)
-                print("char feature shape:", self.char_features.shape)
+                self.log_print(f"char feature shape: {self.char_features.shape}")
             except Exception as e:
-                print(f"Warning: Failed to load char features: {e}")
+                self.log_print(f"Warning: Failed to load char features: {e}")
                 self.char_features = None
                 # 如果加载失败，禁用char特征
                 self.args.w_char = False
@@ -639,19 +697,13 @@ class IBMEA:
             set(self.right_ents) - set(self.train_ill[:, 1].tolist())
         )
 
-        print(
-            "#left entity : %d, #right entity: %d"
-            % (len(self.left_ents), len(self.right_ents))
-        )
-        print(
-            "#left entity not in train set: %d, #right entity not in train set: %d"
-            % (len(self.left_non_train), len(self.right_non_train))
-        )
+        self.log_print(f"#left entity : {len(self.left_ents)}, #right entity: {len(self.right_ents)}")
+        self.log_print(f"#left entity not in train set: {len(self.left_non_train)}, #right entity not in train set: {len(self.right_non_train)}")
         
         # 加载关系特征
         self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
         self.rel_features = torch.Tensor(self.rel_features).to(device)
-        print("relation feature shape:", self.rel_features.shape)
+        self.log_print(f"relation feature shape: {self.rel_features.shape}")
         
         # 加载属性特征
         a1 = os.path.join(file_dir, "training_attrs_1")
@@ -660,39 +712,7 @@ class IBMEA:
             [a1, a2], self.ENT_NUM, self.ent2id_dict, 1000
         ) 
         self.att_features = torch.Tensor(self.att_features).to(device)
-        print("attribute feature shape:", self.att_features.shape)
-
-        # === CLIP相关数据加载 ===
-        if hasattr(self.args, 'use_clip') and self.args.use_clip:
-            print("Initializing CLIP features...")
-            # 加载实体名称用于CLIP文本编码
-            if hasattr(self.args, 'use_entity_names') and self.args.use_entity_names:
-                try:
-                    # 简化版本：暂时禁用实体名称加载
-                    print("Entity names loading disabled for now")
-                    self.entity_names = None
-                    self.entity_text_inputs = None
-                except Exception as e:
-                    print(f"Warning: Failed to load entity names: {e}")
-                    self.entity_names = None
-                    self.entity_text_inputs = None
-            else:
-                self.entity_names = None
-                self.entity_text_inputs = None
-            
-            # 处理图像特征使其兼容CLIP
-            if self.args.w_img:
-                try:
-                    # 简化版本：直接使用现有图像特征
-                    self.clip_img_features = self.img_features
-                    print("Using existing image features for CLIP compatibility")
-                except Exception as e:
-                    print(f"Warning: Failed to prepare CLIP image features: {e}")
-                    self.clip_img_features = self.img_features
-        else:
-            self.entity_names = None
-            self.entity_text_inputs = None
-            self.clip_img_features = None
+        self.log_print(f"attribute feature shape: {self.att_features.shape}")
 
         # 构建邻接矩阵
         self.adj = get_adjr(
@@ -700,7 +720,7 @@ class IBMEA:
         ) 
         self.adj = self.adj.to(self.device)
 
-        print("Data initialization completed successfully!")
+        self.log_print("Data initialization completed successfully!")
 
     def init_model(self):
         img_dim = self.img_features.shape[1]
@@ -708,7 +728,7 @@ class IBMEA:
             self.char_features.shape[1] if self.char_features is not None else 100
         )
     
-        self.multimodal_encoder = IBMultiModal(
+        self.multimodal_encoder = KAMultiModal(
             args=self.args,
             ent_num=self.ENT_NUM,
             img_feature_dim=img_dim,
@@ -722,7 +742,7 @@ class IBMEA:
             for p in self.multimodal_encoder.parameters()
             if p.requires_grad
         )
-        print(f"Total trainable parameters: {total_params}")
+        self.log_print(f"Total trainable parameters: {total_params}")
     
         self.optimizer = optim.AdamW(
             self.params, lr=self.args.lr, weight_decay=self.args.weight_decay
@@ -746,16 +766,6 @@ class IBMEA:
             device=self.device, thresh=ms_base, scale_pos=ms_alpha, scale_neg=ms_beta
         )
         self.criterion_nce = InfoNCE_loss(device=self.device, temperature=self.args.tau)
-        
-        # 添加CLIP损失
-        if hasattr(self.args, 'use_clip') and self.args.use_clip:
-            try:
-                self.criterion_clip = CLIPAlignmentLoss(
-                    device=self.device, 
-                    temperature=self.args.clip_temperature
-                )
-            except:
-                print("Warning: Failed to initialize CLIP loss, using standard loss instead")
 
     def semi_supervised_learning(self):
         with torch.no_grad():
@@ -787,9 +797,9 @@ class IBMEA:
         return preds_l, preds_r
 
     def train(self):
-        print("model config is:")
-        pprint(self.args, indent=2)
-        print("[start training...] ")
+        config_msg = "model config is:\n" + "\n".join([f"  {k}: {v}" for k, v in vars(self.args).items()])
+        self.log_print(config_msg)
+        self.log_print("[start training...] ")
         t_total = time.time()
         new_links = []
         epoch_KE, epoch_CG = 0, 0
@@ -835,7 +845,7 @@ class IBMEA:
             
             for si in np.arange(0, self.train_ill.shape[0], bsize):
                 loss_all = 0
-                print("[epoch {:d}] ".format(epoch), end="")
+                epoch_info = f"[epoch {epoch:4d}]"
                 loss_list = []
                 
                 # === 图结构损失 ===
@@ -847,15 +857,10 @@ class IBMEA:
                             )
                             gph_kld_loss = self.multimodal_encoder.kld_loss
                             loss_G = gph_bce_loss + Beta_g * gph_kld_loss
-                            print(
-                                " gph_bce_loss: {:f}, gph_kld_loss: {:f}, Beta_g: {:f}".format(
-                                    gph_bce_loss, gph_kld_loss, Beta_g
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" gph_bce:{gph_bce_loss:.4f} gph_kld:{gph_kld_loss:.4f}"
                             loss_list.append(loss_G)
                         except Exception as e:
-                            print(f" [gph_loss_failed: {e}]", end="")
+                            epoch_info += f" [gph_loss_failed:{str(e)[:20]}]"
     
                 # === 图像损失 ===
                 if self.args.w_img and img_emb is not None:
@@ -866,15 +871,10 @@ class IBMEA:
                             )
                             img_kld_loss = self.multimodal_encoder.img_kld_loss
                             loss_I = img_bce_loss + Beta_i * img_kld_loss
-                            print(
-                                " img_bce_loss: {:f}, img_kld_loss: {:f}, Beta_i: {:f}".format(
-                                    img_bce_loss, img_kld_loss, Beta_i
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" img_bce:{img_bce_loss:.4f} img_kld:{img_kld_loss:.4f}"
                             loss_list.append(loss_I)
                         except Exception as e:
-                            print(f" [img_loss_failed: {e}]", end="")
+                            epoch_info += f" [img_loss_failed:{str(e)[:20]}]"
     
                 # === 关系损失 ===
                 if self.args.w_rel and rel_emb is not None:
@@ -885,15 +885,10 @@ class IBMEA:
                             )
                             rel_kld_loss = self.multimodal_encoder.rel_kld_loss
                             loss_R = rel_bce_loss + Beta_r * rel_kld_loss
-                            print(
-                                " rel_bce_loss: {:f}, rel_kld_loss: {:f}, Beta_r: {:f}".format(
-                                    rel_bce_loss, rel_kld_loss, Beta_r
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" rel_bce:{rel_bce_loss:.4f} rel_kld:{rel_kld_loss:.4f}"
                             loss_list.append(loss_R)
                         except Exception as e:
-                            print(f" [rel_loss_failed: {e}]", end="")
+                            epoch_info += f" [rel_loss_failed:{str(e)[:20]}]"
     
                 # === 属性损失 ===
                 if self.args.w_attr and att_emb is not None:
@@ -904,15 +899,10 @@ class IBMEA:
                             )
                             attr_kld_loss = self.multimodal_encoder.attr_kld_loss
                             loss_A = attr_bce_loss + Beta_a * attr_kld_loss
-                            print(
-                                " attr_bce_loss: {:f}, attr_kld_loss: {:f}, Beta_a: {:f}".format(
-                                    attr_bce_loss, attr_kld_loss, Beta_a
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" attr_bce:{attr_bce_loss:.4f} attr_kld:{attr_kld_loss:.4f}"
                             loss_list.append(loss_A)
                         except Exception as e:
-                            print(f" [attr_loss_failed: {e}]", end="")
+                            epoch_info += f" [attr_loss_failed:{str(e)[:20]}]"
     
                 # === 联合损失 ===
                 if joint_emb is not None:
@@ -924,15 +914,10 @@ class IBMEA:
                             )
                             joint_kld_loss = self.multimodal_encoder.joint_kld_loss
                             loss_J = joint_bce_loss + self.args.joint_beta * joint_kld_loss
-                            print(
-                                " joint_bce_loss: {:f}, joint_kld_loss: {:f}, joint_beta: {:f}".format(
-                                    joint_bce_loss, joint_kld_loss, self.args.joint_beta
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" joint_bce:{joint_bce_loss:.4f} joint_kld:{joint_kld_loss:.4f}"
                             loss_list.append(loss_J)
                         except Exception as e:
-                            print(f" [joint_vib_loss_failed: {e}]", end="")
+                            epoch_info += f" [joint_vib_loss_failed:{str(e)[:20]}]"
                     else:
                         # 使用多相似性损失
                         try:
@@ -940,25 +925,21 @@ class IBMEA:
                                 joint_emb, self.train_ill[si : si + bsize]
                             )
                             loss_J = joint_ms_loss * self.args.joint_beta
-                            print(
-                                " joint_ms_loss: {:f}, joint_beta: {:f}".format(
-                                    joint_ms_loss, self.args.joint_beta
-                                ),
-                                end="",
-                            )
+                            epoch_info += f" joint_ms:{joint_ms_loss:.4f}"
                             loss_list.append(loss_J)
                         except Exception as e:
-                            print(f" [joint_ms_loss_failed: {e}]", end="")
+                            epoch_info += f" [joint_ms_loss_failed:{str(e)[:20]}]"
                             
                 # === 计算总损失 ===
                 if loss_list:
                     loss_all = sum(loss_list)
                 else:
                     # 如果没有有效损失，创建一个小的dummy损失以保持训练继续
-                    print(" [no_valid_loss, using_dummy]", end="")
+                    epoch_info += " [no_valid_loss, using_dummy]"
                     loss_all = torch.tensor(0.001, device=device, requires_grad=True)
     
-                print(" loss_all: {:f}".format(loss_all))
+                epoch_info += f" loss_all:{loss_all:.4f}"
+                self.log_print(epoch_info, print_console=False)  # 只记录到日志，不打印到控制台
                 
                 # 反向传播
                 if loss_all > 0:
@@ -970,7 +951,7 @@ class IBMEA:
                             norm_type=2,
                         )
                     except Exception as e:
-                        print(f"Warning: Backward pass failed: {e}")
+                        self.log_print(f"Warning: Backward pass failed: {e}", print_console=False)
     
             self.optimizer.step()
             
@@ -982,20 +963,19 @@ class IBMEA:
                 
             # 检查点评估
             if (epoch + 1) % self.args.check_point == 0:
-                print("\n[epoch {:d}] checkpoint!".format(epoch))
+                self.log_print(f"\n[epoch {epoch:4d}] checkpoint!")
                 self.test(epoch)
                 
             # 清理内存
             del joint_emb, gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb
             torch.cuda.empty_cache()
     
-        print("[optimization finished!]")
-        print(
-            "best epoch is {}, hits@1 hits@10 MRR MR is: {}\n".format(
-                self.best_epoch, self.best_data_list
-            )
-        )
-        print("[total time elapsed: {:.4f} s]".format(time.time() - t_total))
+        self.log_print("[optimization finished!]")
+        self.log_print(f"best epoch is {self.best_epoch}, hits@1 hits@10 MRR MR is: {self.best_data_list}")
+        self.log_print(f"[total time elapsed: {time.time() - t_total:.4f} s]")
+        
+        # 保存最终结果
+        self.save_final_results()
 
     def test(self, epoch):
         with torch.no_grad():
@@ -1074,6 +1054,21 @@ class IBMEA:
             for i in range(len(top_k)):
                 acc_l2r[i] = round(acc_l2r[i] / self.test_left.size(0), 4)
                 acc_r2l[i] = round(acc_r2l[i] / self.test_right.size(0), 4)
+            
+            # 记录结果
+            result = {
+                'epoch': epoch,
+                'l2r_h1': float(acc_l2r[0]),
+                'l2r_h10': float(acc_l2r[1]),
+                'l2r_mrr': float(mrr_l2r),
+                'l2r_mr': float(mean_l2r),
+                'r2l_h1': float(acc_r2l[0]),
+                'r2l_h10': float(acc_r2l[1]),
+                'r2l_mrr': float(mrr_r2l),
+                'r2l_mr': float(mean_r2l),
+                'time': time.time() - t_test
+            }
+            self.exp_results.append(result)
                 
             del (
                 distance,
@@ -1087,16 +1082,9 @@ class IBMEA:
             )
             gc.collect()
             
-            print(
-                "l2r: acc of top {} = {}, mr = {:.3f}, mrr = {:.3f}, time = {:.4f} s ".format(
-                    top_k, acc_l2r, mean_l2r, mrr_l2r, time.time() - t_test
-                )
-            )
-            print(
-                "r2l: acc of top {} = {}, mr = {:.3f}, mrr = {:.3f}, time = {:.4f} s \n".format(
-                    top_k, acc_r2l, mean_r2l, mrr_r2l, time.time() - t_test
-                )
-            )
+            # 输出测试结果（格式简洁）
+            test_msg = f"epoch {epoch:4d} | l2r: h1={acc_l2r[0]:.4f} h10={acc_l2r[1]:.4f} mrr={mrr_l2r:.4f} mr={mean_l2r:.2f} | r2l: h1={acc_r2l[0]:.4f} h10={acc_r2l[1]:.4f} mrr={mrr_r2l:.4f} mr={mean_r2l:.2f} | t={time.time()-t_test:.2f}s"
+            self.log_print(test_msg)
             
             if acc_l2r[0] > self.best_hit_1:
                 self.best_hit_1 = acc_l2r[0]
@@ -1108,7 +1096,33 @@ class IBMEA:
                     mean_l2r,
                 ]
 
+    def save_final_results(self):
+        """保存最终结果"""
+        results = {
+            'config': {k: v for k, v in vars(self.args).items() if isinstance(v, (str, int, float, bool))},
+            'dataset_info': {
+                'entity_num': self.ENT_NUM,
+                'relation_num': self.REL_NUM,
+                'train_ill_num': len(self.train_ill),
+                'test_ill_num': len(self.test_ill)
+            },
+            'best_results': {
+                'epoch': self.best_epoch,
+                'hit_1': self.best_data_list[0] if self.best_data_list else 0.0,
+                'hit_10': self.best_data_list[1] if len(self.best_data_list) > 1 else 0.0,
+                'mrr': self.best_data_list[2] if len(self.best_data_list) > 2 else 0.0,
+                'mr': self.best_data_list[3] if len(self.best_data_list) > 3 else 0.0
+            },
+            'all_results': self.exp_results
+        }
+        
+        with open(os.path.join(self.log_dir, "results.json"), 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        final_msg = f"\nResults saved to: {self.log_dir}"
+        self.log_print(final_msg)
+
 
 if __name__ == "__main__":
-    model = IBMEA()
+    model = KACEA()
     model.train()
