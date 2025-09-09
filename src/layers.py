@@ -188,3 +188,42 @@ class ProjectionHead(nn.Module):
         x = F.dropout(x, self.dropout, training=self.training)
         x = self.l2(x)
         return x
+
+
+# 新增：改进的注意力层
+class ImprovedAttention(nn.Module):
+    """改进的注意力机制"""
+    
+    def __init__(self, input_dim, num_heads=8, dropout=0.1):
+        super(ImprovedAttention, self).__init__()
+        self.input_dim = input_dim
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
+        
+        assert self.head_dim * num_heads == input_dim, "input_dim must be divisible by num_heads"
+        
+        self.query = nn.Linear(input_dim, input_dim)
+        self.key = nn.Linear(input_dim, input_dim)
+        self.value = nn.Linear(input_dim, input_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(self.head_dim)
+        
+    def forward(self, x):
+        batch_size, seq_len, _ = x.size()
+        
+        # Linear transformations
+        Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        attention_weights = F.softmax(scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        # Apply attention to values
+        attended = torch.matmul(attention_weights, V)
+        attended = attended.transpose(1, 2).contiguous().view(batch_size, seq_len, self.input_dim)
+        
+        return attended, attention_weights

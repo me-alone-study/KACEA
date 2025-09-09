@@ -17,7 +17,6 @@ import gc
 from tqdm import tqdm
 import json
 from torch.utils.data import Dataset
-
 import torch.optim as optim
 
 
@@ -129,7 +128,7 @@ def get_adjr(ent_size, triples, norm=False):
     ind, val = [], []
     for fir, sec in M:
         ind.append((fir, sec))
-        ind.append((sec, fir))  # 关系逆
+        ind.append((sec, fir))  
         val.append(M[(fir, sec)])
         val.append(M[(fir, sec)])
     for i in range(ent_size):
@@ -243,6 +242,46 @@ def normalize_zero_one(A):
     A -= A.min(1, keepdim=True)[0]
     A /= A.max(1, keepdim=True)[0]
     return A
+
+
+# 新增：安全的tensor操作函数
+def safe_tensor_operation(func, *args, **kwargs):
+    """安全的tensor操作，带异常处理"""
+    try:
+        return func(*args, **kwargs)
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+            print(f"Warning: CUDA out of memory, operation failed: {e}")
+            return None
+        else:
+            raise e
+    except Exception as e:
+        print(f"Warning: Tensor operation failed: {e}")
+        return None
+
+
+def batch_pairwise_distances(x, y=None, batch_size=1000):
+    """分批计算距离，避免内存溢出"""
+    if y is None:
+        y = x
+    
+    x_size = x.size(0)
+    y_size = y.size(0)
+    
+    # 如果数据量小，直接计算
+    if x_size * y_size < 1000000:
+        return pairwise_distances(x, y)
+    
+    # 分批计算
+    distance_list = []
+    for i in range(0, x_size, batch_size):
+        x_batch = x[i:i+batch_size]
+        dist_batch = pairwise_distances(x_batch, y)
+        distance_list.append(dist_batch)
+    
+    return torch.cat(distance_list, dim=0)
 
 
 if __name__ == "__main__":

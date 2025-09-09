@@ -7,13 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gc
 
-# 添加CLIP相关导入
+# CLIP相关导入
 try:
-    from transformers import CLIPModel, CLIPVisionModel, CLIPTextModel
+    from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
     CLIP_AVAILABLE = True
 except ImportError:
     print("Warning: transformers not available, CLIP features disabled")
-    CLIPModel = CLIPVisionModel = CLIPTextModel = None
+    CLIPModel = CLIPProcessor = CLIPTokenizer = None
     CLIP_AVAILABLE = False
 
 try:
@@ -100,66 +100,156 @@ class SimpleGAT(nn.Module):
         return output
 
 
-class CLIPFusionLayer(nn.Module):
-    """CLIP特征融合层"""
+class CLIPEntityEncoder(nn.Module):
+    """正确的CLIP实体编码器"""
     
-    def __init__(self, img_dim, text_dim, fusion_dim, fusion_strategy="concat"):
-        super(CLIPFusionLayer, self).__init__()
+    def __init__(self, clip_model_name="openai/clip-vit-base-patch32", freeze_clip=True, device=None):
+        super(CLIPEntityEncoder, self).__init__()
+        
+        if not CLIP_AVAILABLE:
+            raise ImportError("transformers library required for CLIP")
+        
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 加载预训练的CLIP模型
+        self.clip_model = CLIPModel.from_pretrained(clip_model_name)
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+        self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+        
+        # 移动到指定设备
+        self.clip_model = self.clip_model.to(self.device)
+        
+        # 是否冻结CLIP参数
+        if freeze_clip:
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
+        
+        # CLIP输出维度
+        self.clip_dim = self.clip_model.config.projection_dim  # 通常是512
+        
+    def encode_images(self, image_features):
+        """编码图像特征 - 直接使用预提取的图像特征"""
+        # 由于我们使用的是预提取的图像特征，这里做一个简单的投影
+        # 将原始图像特征投影到CLIP维度
+        if not hasattr(self, 'image_projection'):
+            input_dim = image_features.size(-1)
+            self.image_projection = nn.Linear(input_dim, self.clip_dim).to(self.device)
+        
+        projected = self.image_projection(image_features)
+        return F.normalize(projected, dim=-1)
+    
+    def encode_texts(self, texts):
+        """编码文本"""
+        if isinstance(texts, str):
+            texts = [texts]
+        
+        # 使用CLIP tokenizer处理文本
+        inputs = self.clip_tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True,
+            max_length=77
+        )
+        
+        # 移动到正确的设备
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # 获取文本嵌入
+        with torch.no_grad():
+            text_outputs = self.clip_model.get_text_features(**inputs)
+        
+        return F.normalize(text_outputs, dim=-1)
+    
+    def forward(self, image_features=None, texts=None):
+        """前向传播"""
+        results = {}
+        
+        if image_features is not None:
+            results['image_embeds'] = self.encode_images(image_features)
+        
+        if texts is not None:
+            results['text_embeds'] = self.encode_texts(texts)
+        
+        return results
+
+
+class KnowledgeAwareFusion(nn.Module):
+    """知识感知的特征融合层"""
+    
+    def __init__(self, modal_dims, output_dim, fusion_strategy="weighted_concat"):
+        super(KnowledgeAwareFusion, self).__init__()
         self.fusion_strategy = fusion_strategy
-        self.img_dim = img_dim
-        self.text_dim = text_dim
-        self.fusion_dim = fusion_dim
+        self.modal_dims = modal_dims
+        self.output_dim = output_dim
         
-        if fusion_strategy == "concat":
-            self.fusion_fc = nn.Linear(img_dim + text_dim, fusion_dim)
+        if fusion_strategy == "weighted_concat":
+            # 为每个模态学习权重
+            self.modal_weights = nn.Parameter(torch.ones(len(modal_dims)))
+            total_dim = sum(modal_dims.values())
+            self.projection = nn.Linear(total_dim, output_dim)
+            
         elif fusion_strategy == "attention":
-            self.attention = nn.MultiheadAttention(embed_dim=img_dim, num_heads=8)
-            self.fusion_fc = nn.Linear(img_dim, fusion_dim)
-        elif fusion_strategy == "gate":
-            self.gate_img = nn.Linear(img_dim, img_dim)
-            self.gate_text = nn.Linear(text_dim, text_dim)
-            self.fusion_fc = nn.Linear(img_dim + text_dim, fusion_dim)
-        elif fusion_strategy == "add":
-            assert img_dim == text_dim, "For add fusion, img_dim must equal text_dim"
-            self.fusion_fc = nn.Linear(img_dim, fusion_dim)
+            # 注意力融合
+            total_dim = sum(modal_dims.values())
+            self.attention = nn.Linear(total_dim, len(modal_dims))
+            self.projection = nn.Linear(total_dim, output_dim)
+            
+        elif fusion_strategy == "simple_concat":
+            # 简单拼接
+            total_dim = sum(modal_dims.values())
+            self.projection = nn.Linear(total_dim, output_dim)
+    
+    def forward(self, modal_features, knowledge_context=None):
+        """
+        Args:
+            modal_features: dict, 包含不同模态的特征
+            knowledge_context: 知识上下文信息（如图结构嵌入）
+        """
+        valid_features = []
+        feature_names = []
         
-    def forward(self, img_features, text_features):
-        if img_features is None or text_features is None:
-            if img_features is not None:
-                return self.fusion_fc(img_features)
-            elif text_features is not None:
-                return self.fusion_fc(text_features)
-            else:
-                return None
+        for name, dim in self.modal_dims.items():
+            if name in modal_features and modal_features[name] is not None:
+                valid_features.append(modal_features[name])
+                feature_names.append(name)
         
-        if self.fusion_strategy == "concat":
-            fused = torch.cat([img_features, text_features], dim=-1)
-            return self.fusion_fc(fused)
+        if not valid_features:
+            # 如果没有有效特征，返回零特征
+            batch_size = 1
+            device = next(self.parameters()).device
+            return torch.zeros(batch_size, self.output_dim, device=device)
+        
+        if self.fusion_strategy == "weighted_concat":
+            # 加权拼接
+            weights = torch.softmax(self.modal_weights[:len(valid_features)], dim=0)
+            weighted_features = [w * f for w, f in zip(weights, valid_features)]
+            fused = torch.cat(weighted_features, dim=-1)
             
         elif self.fusion_strategy == "attention":
-            # 使用注意力机制融合
-            img_features = img_features.unsqueeze(1)  # [B, 1, D]
-            text_features = text_features.unsqueeze(1)  # [B, 1, D]
-            attn_output, _ = self.attention(img_features, text_features, text_features)
-            return self.fusion_fc(attn_output.squeeze(1))
+            # 注意力融合
+            concat_features = torch.cat(valid_features, dim=-1)
+            attention_weights = torch.softmax(self.attention(concat_features), dim=-1)
             
-        elif self.fusion_strategy == "gate":
-            # 使用门控机制融合
-            gate_img = torch.sigmoid(self.gate_img(img_features))
-            gate_text = torch.sigmoid(self.gate_text(text_features))
-            gated_img = gate_img * img_features
-            gated_text = gate_text * text_features
-            fused = torch.cat([gated_img, gated_text], dim=-1)
-            return self.fusion_fc(fused)
+            # 应用注意力权重
+            weighted_features = []
+            start_idx = 0
+            for i, feature in enumerate(valid_features):
+                end_idx = start_idx + feature.size(-1)
+                weight = attention_weights[:, i:i+1]
+                weighted_features.append(weight * feature)
+                start_idx = end_idx
             
-        elif self.fusion_strategy == "add":
-            # 简单相加融合
-            fused = img_features + text_features
-            return self.fusion_fc(fused)
+            fused = torch.cat(weighted_features, dim=-1)
+            
+        else:  # simple_concat
+            fused = torch.cat(valid_features, dim=-1)
+        
+        return self.projection(fused)
 
 
-class KAMultiModal(nn.Module):
-    """修复的IBMEA多模态模型，支持CLIP"""
+class IBMultiModal(nn.Module):
+    """修正后的多模态实体对齐模型"""
     
     def __init__(
         self,
@@ -169,7 +259,7 @@ class KAMultiModal(nn.Module):
         char_feature_dim=None,
         use_project_head=False,
     ):
-        super(KAMultiModal, self).__init__()
+        super(IBMultiModal, self).__init__()
 
         self.args = args
         attr_dim = self.args.attr_dim
@@ -201,22 +291,27 @@ class KAMultiModal(nn.Module):
 
         # CLIP相关组件
         self.use_clip = getattr(args, 'use_clip', False)
-        if self.use_clip:
-            # CLIP特征融合层
-            self.clip_fusion = CLIPFusionLayer(
-                img_dim=img_dim,
-                text_dim=img_dim,  # 假设文本特征维度与图像特征相同
-                fusion_dim=img_dim,
-                fusion_strategy=getattr(args, 'clip_fusion_strategy', 'concat')
-            )
-            
-            # CLIP变分编码器（如果启用）
-            if getattr(args, 'use_clip_vib', False):
-                self.clip_fc_mu = nn.Linear(img_dim, img_dim)
-                self.clip_fc_std = nn.Linear(img_dim, img_dim)
-                self.use_clip_vib = True
-            else:
-                self.use_clip_vib = False
+        if self.use_clip and CLIP_AVAILABLE:
+            try:
+                self.clip_encoder = CLIPEntityEncoder(
+                    clip_model_name=getattr(args, 'clip_model_name', 'openai/clip-vit-base-patch32'),
+                    freeze_clip=getattr(args, 'clip_freeze', True),
+                    device=getattr(args, 'device', None)
+                )
+                self.clip_dim = self.clip_encoder.clip_dim
+                
+                # CLIP特征投影层
+                self.clip_projection = nn.Linear(self.clip_dim, img_dim)
+                
+                print(f"CLIP encoder initialized with dimension {self.clip_dim}")
+            except Exception as e:
+                print(f"Warning: Failed to initialize CLIP encoder: {e}")
+                self.use_clip = False
+                self.clip_encoder = None
+                self.clip_dim = 0
+        else:
+            self.clip_encoder = None
+            self.clip_dim = 0
 
         # 变分信息瓶颈相关
         self.use_graph_vib = getattr(args, 'use_graph_vib', False)
@@ -243,17 +338,23 @@ class KAMultiModal(nn.Module):
         if self.args.structure_encoder == "gcn":
             if self.use_graph_vib:
                 self.cross_graph_model_mu = SimpleGCN(
-                    self.n_units[0], self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
-                    self.n_units[-1], dropout
+                    self.n_units[0], 
+                    self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
+                    self.n_units[-1], 
+                    dropout
                 )
                 self.cross_graph_model_std = SimpleGCN(
-                    self.n_units[0], self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
-                    self.n_units[-1], dropout
+                    self.n_units[0], 
+                    self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
+                    self.n_units[-1], 
+                    dropout
                 )
             else:
                 self.cross_graph_model = SimpleGCN(
-                    self.n_units[0], self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
-                    self.n_units[-1], dropout
+                    self.n_units[0], 
+                    self.n_units[1] if len(self.n_units) > 1 else self.n_units[0], 
+                    self.n_units[-1], 
+                    dropout
                 )
         elif self.args.structure_encoder == "gat":
             if self.use_graph_vib:
@@ -284,22 +385,22 @@ class KAMultiModal(nn.Module):
                 )
 
         # 多模态融合
-        total_dim = 0
-        if args.w_gcn: total_dim += self.n_units[-1]
-        if args.w_img: total_dim += img_dim
-        if args.w_rel: total_dim += attr_dim  
-        if args.w_attr: total_dim += attr_dim
-        if args.w_name: total_dim += char_dim
-        if args.w_char: total_dim += char_dim
+        modal_dims = {}
+        if args.w_gcn: modal_dims['graph'] = self.n_units[-1]
+        if args.w_img: modal_dims['image'] = img_dim
+        if args.w_rel: modal_dims['relation'] = attr_dim  
+        if args.w_attr: modal_dims['attribute'] = attr_dim
+        if args.w_name: modal_dims['name'] = char_dim
+        if args.w_char: modal_dims['char'] = char_dim
+        if self.use_clip: modal_dims['clip'] = img_dim  # CLIP特征投影后的维度
         
-        # 多模态融合器
-        if getattr(args, 'fusion_id', 1) == 1:
-            self.fusion = MultiModalFusion(
-                modal_num=getattr(args, 'inner_view_num', 6), 
-                with_weight=getattr(args, 'with_weight', 1)
-            )
-        else:
-            self.fusion = SimpleFusion(total_dim)
+        # 知识感知融合层
+        joint_dim = getattr(args, 'joint_dim', 600)
+        self.fusion = KnowledgeAwareFusion(
+            modal_dims=modal_dims,
+            output_dim=joint_dim,
+            fusion_strategy=getattr(args, 'fusion_strategy', 'weighted_concat')
+        )
 
         # 投影头
         if self.use_project_head:
@@ -309,7 +410,6 @@ class KAMultiModal(nn.Module):
             self.gph_pro = ProjectionHead(self.n_units[-1], self.n_units[-1], self.n_units[-1], dropout)
 
         # 联合变分编码
-        joint_dim = max(total_dim, 128)
         if self.use_joint_vib:
             self.joint_fc = nn.Linear(joint_dim, joint_dim)
             self.joint_fc_mu = nn.Linear(joint_dim, joint_dim)
@@ -321,7 +421,7 @@ class KAMultiModal(nn.Module):
         self.rel_kld_loss = 0
         self.attr_kld_loss = 0
         self.joint_kld_loss = 0
-        self.clip_kld_loss = 0
+        self.clip_features = {}  # 存储CLIP特征用于损失计算
 
     def _kld_gauss(self, mu_1, logsigma_1, mu_2, logsigma_2):
         """KL散度计算"""
@@ -329,8 +429,8 @@ class KAMultiModal(nn.Module):
             from torch.distributions.kl import kl_divergence
             from torch.distributions import Normal
             
-            sigma_1 = torch.exp(0.1 + 0.9 * F.softplus(torch.clamp_max(logsigma_1, 0.4)))
-            sigma_2 = torch.exp(0.1 + 0.9 * F.softplus(torch.clamp_max(logsigma_2, 0.4)))
+            sigma_1 = torch.exp(0.1 + 0.9 * F.softplus(torch.clamp(logsigma_1, -10, 10)))
+            sigma_2 = torch.exp(0.1 + 0.9 * F.softplus(torch.clamp(logsigma_2, -10, 10)))
             
             # 处理NaN和inf
             mu_1 = torch.clamp(mu_1, -10, 10)
@@ -341,14 +441,14 @@ class KAMultiModal(nn.Module):
             q_target = Normal(mu_1, sigma_1)
             q_context = Normal(mu_2, sigma_2)
             
-            kl = kl_divergence(q_target, q_context).mean(dim=0).sum()
+            kl = kl_divergence(q_target, q_context).mean()
             return torch.clamp(kl, 0, 100)
         except:
             # 简化版本的KL散度
             kl = 0.5 * (logsigma_2 - logsigma_1 - 1.0 + 
                        torch.exp(logsigma_1 - logsigma_2) + 
                        (mu_1 - mu_2) ** 2 * torch.exp(-logsigma_2))
-            return torch.clamp(kl.sum(), 0, 100)
+            return torch.clamp(kl.mean(), 0, 100)
 
     def forward(
         self,
@@ -359,17 +459,19 @@ class KAMultiModal(nn.Module):
         att_features=None,
         name_features=None,
         char_features=None,
-        entity_names=None,
+        entity_texts=None,
     ):
-        embeddings = []
+        modal_features = {}
+        self.clip_features = {}  # 重置CLIP特征存储
         
         # === 图结构特征处理 ===
         gph_emb = None
         if self.args.w_gcn:
             try:
+                entity_input = self.entity_emb(input_idx)
                 if self.use_graph_vib:
-                    gph_emb_mu = self.cross_graph_model_mu(self.entity_emb(input_idx), adj)
-                    gph_emb_std = self.cross_graph_model_std(self.entity_emb(input_idx), adj)
+                    gph_emb_mu = self.cross_graph_model_mu(entity_input, adj)
+                    gph_emb_std = self.cross_graph_model_std(entity_input, adj)
                     eps = torch.randn_like(gph_emb_std)
                     gph_emb = gph_emb_mu + eps * gph_emb_std
                     self.kld_loss = self._kld_gauss(
@@ -377,44 +479,19 @@ class KAMultiModal(nn.Module):
                         torch.zeros_like(gph_emb_mu), torch.ones_like(gph_emb_std)
                     )
                 else:
-                    gph_emb = self.cross_graph_model(self.entity_emb(input_idx), adj)
-                embeddings.append(gph_emb)
+                    gph_emb = self.cross_graph_model(entity_input, adj)
+                modal_features['graph'] = gph_emb
             except Exception as e:
                 print(f"Warning: Graph encoding failed: {e}")
                 gph_emb = self.entity_emb(input_idx)
-                embeddings.append(gph_emb)
+                modal_features['graph'] = gph_emb
 
         # === 图像特征处理 ===
         img_emb = None
         if self.args.w_img and img_features is not None:
             try:
-                # 基础图像特征处理
                 img_emb = self.img_fc(img_features)
                 
-                # CLIP特征融合（如果启用）
-                if self.use_clip and hasattr(self, 'clip_fusion') and entity_names is not None:
-                    # 处理CLIP文本特征
-                    text_emb = self.img_fc(entity_names)  # 将文本特征投影到相同维度
-                    
-                    # 融合CLIP图像和文本特征
-                    clip_fused = self.clip_fusion(img_emb, text_emb)
-                    
-                    # CLIP变分处理
-                    if self.use_clip_vib:
-                        clip_h = F.relu(clip_fused)
-                        clip_mu = self.clip_fc_mu(clip_h)
-                        clip_logvar = self.clip_fc_std(clip_h)
-                        clip_std = torch.exp(0.5 * clip_logvar)
-                        clip_eps = torch.randn_like(clip_std)
-                        clip_fused = clip_mu + clip_eps * clip_std
-                        self.clip_kld_loss = self._kld_gauss(
-                            clip_mu, clip_std, torch.zeros_like(clip_mu), torch.ones_like(clip_std)
-                        )
-                    
-                    # 将CLIP融合特征与原始图像特征结合
-                    img_emb = (img_emb + clip_fused) / 2  # 简单平均融合
-                
-                # 图像特征的变分处理
                 if self.use_img_vib:
                     img_emb_h = F.relu(img_emb)
                     mu = self.img_fc_mu(img_emb_h)
@@ -426,7 +503,7 @@ class KAMultiModal(nn.Module):
                         mu, std, torch.zeros_like(mu), torch.ones_like(std)
                     )
                 
-                embeddings.append(img_emb)
+                modal_features['image'] = img_emb
             except Exception as e:
                 print(f"Warning: Image encoding failed: {e}")
 
@@ -447,7 +524,7 @@ class KAMultiModal(nn.Module):
                     )
                 else:
                     rel_emb = self.rel_fc(rel_features)
-                embeddings.append(rel_emb)
+                modal_features['relation'] = rel_emb
             except Exception as e:
                 print(f"Warning: Relation encoding failed: {e}")
 
@@ -468,7 +545,7 @@ class KAMultiModal(nn.Module):
                     )
                 else:
                     att_emb = self.att_fc(att_features)
-                embeddings.append(att_emb)
+                modal_features['attribute'] = att_emb
             except Exception as e:
                 print(f"Warning: Attribute encoding failed: {e}")
 
@@ -477,7 +554,7 @@ class KAMultiModal(nn.Module):
         if self.args.w_name and name_features is not None:
             try:
                 name_emb = self.name_fc(name_features)
-                embeddings.append(name_emb)
+                modal_features['name'] = name_emb
             except Exception as e:
                 print(f"Warning: Name encoding failed: {e}")
             
@@ -485,32 +562,78 @@ class KAMultiModal(nn.Module):
         if self.args.w_char and char_features is not None:
             try:
                 char_emb = self.char_fc(char_features)
-                embeddings.append(char_emb)
+                modal_features['char'] = char_emb
             except Exception as e:
                 print(f"Warning: Char encoding failed: {e}")
 
+        # === CLIP特征处理 ===
+        if self.use_clip and self.clip_encoder is not None:
+            try:
+                clip_results = {}
+                
+                # 编码图像特征
+                if img_features is not None:
+                    clip_results['image_embeds'] = self.clip_encoder.encode_images(img_features)
+                    self.clip_features['image_embeds'] = clip_results['image_embeds']
+                
+                # 编码文本特征
+                if entity_texts is not None:
+                    clip_results['text_embeds'] = self.clip_encoder.encode_texts(entity_texts)
+                    self.clip_features['text_embeds'] = clip_results['text_embeds']
+                
+                # 融合CLIP特征
+                if 'image_embeds' in clip_results and 'text_embeds' in clip_results:
+                    # 使用注意力机制融合图像和文本特征
+                    img_clip = clip_results['image_embeds']
+                    text_clip = clip_results['text_embeds']
+                    
+                    # 简单的加权平均（可以改进为注意力机制）
+                    clip_fused = (img_clip + text_clip) / 2
+                    clip_projected = self.clip_projection(clip_fused)
+                    modal_features['clip'] = clip_projected
+                    
+                elif 'image_embeds' in clip_results:
+                    clip_projected = self.clip_projection(clip_results['image_embeds'])
+                    modal_features['clip'] = clip_projected
+                    
+                elif 'text_embeds' in clip_results:
+                    clip_projected = self.clip_projection(clip_results['text_embeds'])
+                    modal_features['clip'] = clip_projected
+                    
+            except Exception as e:
+                print(f"Warning: CLIP encoding failed: {e}")
+
         # === 投影头处理 ===
         if self.use_project_head:
-            if gph_emb is not None and hasattr(self, 'gph_pro'):
-                gph_emb = self.gph_pro(gph_emb)
-            if img_emb is not None and hasattr(self, 'img_pro'):
-                img_emb = self.img_pro(img_emb)
-            if rel_emb is not None and hasattr(self, 'rel_pro'):
-                rel_emb = self.rel_pro(rel_emb)
-            if att_emb is not None and hasattr(self, 'att_pro'):
-                att_emb = self.att_pro(att_emb)
+            if 'image' in modal_features:
+                modal_features['image'] = self.img_pro(modal_features['image'])
+            if 'attribute' in modal_features:
+                modal_features['attribute'] = self.att_pro(modal_features['attribute'])
+            if 'relation' in modal_features:
+                modal_features['relation'] = self.rel_pro(modal_features['relation'])
+            if 'graph' in modal_features:
+                modal_features['graph'] = self.gph_pro(modal_features['graph'])
 
         # === 多模态融合 ===
         try:
-            joint_emb = self.fusion([img_emb, att_emb, rel_emb, gph_emb, name_emb, char_emb])
+            knowledge_context = modal_features.get('graph', None)
+            joint_emb = self.fusion(modal_features, knowledge_context)
         except Exception as e:
             print(f"Warning: Fusion failed: {e}")
             # Fallback融合
-            valid_embeddings = [emb for emb in embeddings if emb is not None]
+            valid_embeddings = [emb for emb in modal_features.values() if emb is not None]
             if valid_embeddings:
+                # 简单拼接
                 joint_emb = torch.cat(valid_embeddings, dim=-1)
+                # 投影到目标维度
+                if not hasattr(self, 'fallback_projection'):
+                    input_dim = joint_emb.size(-1)
+                    output_dim = getattr(self.args, 'joint_dim', 600)
+                    self.fallback_projection = nn.Linear(input_dim, output_dim).to(joint_emb.device)
+                joint_emb = self.fallback_projection(joint_emb)
             else:
-                joint_emb = torch.zeros(input_idx.size(0), 128, device=input_idx.device)
+                joint_emb = torch.zeros(input_idx.size(0), getattr(self.args, 'joint_dim', 600), 
+                                      device=input_idx.device)
 
         # === 联合变分编码 ===
         if self.use_joint_vib:
@@ -531,51 +654,6 @@ class KAMultiModal(nn.Module):
         return gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb
 
 
-class MultiModalFusion(nn.Module):
-    """多模态融合模块"""
-    def __init__(self, modal_num=6, with_weight=1):
-        super(MultiModalFusion, self).__init__()
-        self.modal_num = modal_num
-        self.with_weight = with_weight
-        if with_weight:
-            self.weight = nn.Parameter(torch.ones(modal_num))
-    
-    def forward(self, modal_list):
-        valid_modals = [modal for modal in modal_list if modal is not None]
-        if not valid_modals:
-            # 如果没有有效模态，返回零张量
-            device = modal_list[0].device if modal_list and modal_list[0] is not None else torch.device('cpu')
-            return torch.zeros(1, 128, device=device)
-        
-        if self.with_weight and hasattr(self, 'weight'):
-            weighted_modals = []
-            weight_idx = 0
-            for modal in modal_list:
-                if modal is not None:
-                    if weight_idx < len(self.weight):
-                        weighted_modals.append(self.weight[weight_idx] * modal)
-                        weight_idx += 1
-                    else:
-                        weighted_modals.append(modal)
-            if weighted_modals:
-                return torch.cat(weighted_modals, dim=-1)
-        
-        return torch.cat(valid_modals, dim=-1)
-
-
-class SimpleFusion(nn.Module):
-    """简单融合模块"""
-    def __init__(self, total_dim):
-        super(SimpleFusion, self).__init__()
-        self.total_dim = total_dim
-        
-    def forward(self, modal_list):
-        valid_modals = [modal for modal in modal_list if modal is not None]
-        if not valid_modals:
-            device = modal_list[0].device if modal_list and modal_list[0] is not None else torch.device('cpu')
-            return torch.zeros(1, 128, device=device)
-        return torch.cat(valid_modals, dim=-1)
-
-
 # 为了保持兼容性，设置别名
-ClipEnhancedKACEA = KAMultiModal
+KAMultiModal = IBMultiModal
+ClipEnhancedKACEA = IBMultiModal

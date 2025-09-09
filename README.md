@@ -1,61 +1,139 @@
-# KACEA
+# KACEA Installation Guide
 
-1. 创建新环境（推荐 Python 3.9，兼容性最佳）
+This guide provides step-by-step instructions for setting up the KACEA environment with optimal compatibility using Python 3.9.
+
+## 1. Create New Environment
+
+Create a new conda environment with Python 3.9 for best compatibility:
+
+```bash
 conda create -n KACEA python=3.9 -y
+conda activate KACEA
+```
 
-2. 配置渠道（确保下载速度和兼容性）
-保留原环境的有效渠道，并补充必要渠道：
-conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
-conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
-conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/Paddle/
-conda config --add channels pytorch
-conda config --set show_channel_urls yes  # 显示渠道来源
+## 2. Configure Channels
 
-4. 安装核心依赖（PyTorch+CUDA）
+Configure conda channels to ensure optimal download speed and compatibility:
 
+```bash
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/ 
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/ 
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/Paddle/ 
+conda config --add channels pytorch 
+conda config --set show_channel_urls yes
+```
+
+## 3. Install Core Dependencies
+
+### Install CUDA Toolkit
+
+```bash
 conda install cudatoolkit=11.6 -c nvidia -y --override-channels
+```
 
-# 安装PyTorch和配套库
-pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1+cu116 \
-  --extra-index-url https://download.pytorch.org/whl/cu116
+### Install PyTorch with CUDA Support
 
-验证 PyTorch 是否生效：
-启动 Python，运行
+```bash
+pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
+```
 
-import torch; print(torch.cuda.is_available())
+### Verify PyTorch Installation
 
-返回True则正常。
+Start Python and run the following verification script:
 
-4. 安装 CLIP 及关键依赖
-pip install git+https://github.com/openai/CLIP.git
-pip install ftfy regex tqdm  # CLIP必需
-pip install pillow==9.5.0  # 图像处理（适配高版本Python）
-pip install numpy==1.24.3  # 数值计算（升级到3.9兼容版本）
-conda install pandas==1.5.3 -y  # 升级pandas（支持Python 3.9）
-conda install scikit-learn==1.2.2 -y  # 机器学习工具
-pip install transformers==4.30.2  # 升级transformers（支持CLIP相关模型）
-pip install huggingface-hub==0.16.4  # 模型下载工具
-conda install matplotlib==3.7.1 -y  # 绘图工具
-pip install ipython==8.14.0  # 交互终端（适配3.9）
+```python
+import torch
+print(torch.cuda.is_available())
+```
+
+If the output is `True`, PyTorch with CUDA is properly installed.
+
+## 4. Install CLIP and Key Dependencies
+
+### Install CLIP
+
+```bash
+pip install git+https://github.com/openai/CLIP.git 
+pip install ftfy regex tqdm 
+```
+
+### Install Image and Data Processing Libraries
+
+```bash
+pip install pillow==9.5.0  
+pip install numpy==1.24.3 
+conda install pandas==1.5.3 -y 
+conda install scikit-learn==1.2.2 -y 
+conda install matplotlib==3.7.1 -y  
+pip install ipython==8.14.0 
+```
+
+### Install Machine Learning Libraries
+
+```bash
+pip install huggingface-hub==0.16.4 
 conda install -c metric-learning pytorch-metric-learning
+pip install pytorch-metric-learning tqdm scikit-learn
+pip install transformers==4.35.2
+pip install accelerate
+```
 
-6. 验证环境是否可用
-运行test_clip.py
+## 5. Environment Verification
 
-  # 输出类似[[0.99, 0.01]]即正常
+### Test CLIP Installation
 
-# 测试模型
+Run the test script to verify CLIP is working properly:
+
+```bash
+python test_clip.py
+```
+
+Expected output should be similar to: `[[0.99, 0.01]]`
+
+### Test Model Training
+
+Run a complete model test with the following command:
+
+```bash
 python3 -u src/run.py \
-    --file_dir data/DBP15K/zh_en \
-    --epochs 3 \
-    --check_point 1 \
-    --pred_name test_complete \
-    --bsize 500 \
-    --hidden_units "32,32" \
-    --structure_encoder gcn \
-    --dropout 0.1 \
-    --attr_dim 32 \
-    --img_dim 32 \
-    --char_dim 32 \
-    --w_name \
-    --w_char
+  --file_dir data/DBP15K/zh_en \
+  --epochs 3 \
+  --check_point 1 \
+  --pred_name test_complete \
+  --bsize 500 \
+  --hidden_units "32,32" \
+  --structure_encoder gcn \
+  --dropout 0.1 \
+  --attr_dim 32 \
+  --img_dim 32 \
+  --char_dim 32 \
+  --w_name \
+  --w_char
+```
+
+## Dependencies Summary
+
+| Package | Version | Installation Method |
+|---------|---------|-------------------|
+| Python | 3.9 | conda |
+| PyTorch | 1.13.1+cu116 | pip |
+| CUDA Toolkit | 11.6 | conda |
+| NumPy | 1.24.3 | pip |
+| Pandas | 1.5.3 | conda |
+| Scikit-learn | 1.2.2 | conda |
+| Transformers | 4.35.2 | pip |
+| Pillow | 9.5.0 | pip |
+| Matplotlib | 3.7.1 | conda |
+
+## Troubleshooting
+
+- If CUDA is not available, check your GPU drivers and CUDA installation
+- For download issues, verify the conda channels are properly configured
+- If package conflicts occur, try creating a fresh environment
+- For Chinese mirror access issues, you may need to use default conda channels
+
+## Notes
+
+- This setup uses CUDA 11.6 for optimal compatibility
+- Chinese Tsinghua mirrors are configured for faster downloads in China
+- All version numbers are specified to ensure reproducible installations

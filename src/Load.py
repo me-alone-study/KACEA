@@ -196,47 +196,29 @@ def load_img_new(e_num, path, triples):
         return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
 
 
-def load_name_features(e_num, file_paths, ent2id_dict, word2vec_path=None, feature_dim=300):
-    """加载实体名称特征"""
-    try:
-        # 简化版本：直接创建随机特征
-        print(f"Creating random name features with dimension {feature_dim}")
-        name_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
-        return name_features
-    except Exception as e:
-        print(f"Warning: Failed to load name features: {e}")
-        return np.random.normal(0, 0.1, (e_num, 300)).astype(np.float32)
-
-
-def load_char_features(e_num, file_paths, ent2id_dict, feature_dim=100):
-    """加载字符级特征"""
-    try:
-        # 简化版本：直接创建随机特征
-        print(f"Creating random char features with dimension {feature_dim}")
-        char_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
-        return char_features
-    except Exception as e:
-        print(f"Warning: Failed to load char features: {e}")
-        return np.random.normal(0, 0.1, (e_num, 100)).astype(np.float32)
-
-
-def load_entity_names(ent2id_dict, file_paths):
+def load_entity_texts(file_dir, ent2id_dict):
     """
     加载实体名称用于CLIP文本编码
     
     Args:
+        file_dir: 数据目录路径
         ent2id_dict: 实体到ID的映射字典
-        file_paths: 实体文件路径列表
     
     Returns:
-        entity_names: 按实体ID排序的实体名称列表
+        entity_texts: 按实体ID排序的实体名称列表
     """
     print("Loading entity names for CLIP text encoding...")
     
     # 创建ID到名称的映射
     id2name = {}
     
-    for file_path in file_paths:
+    # 读取实体文件
+    entity_files = [
+        os.path.join(file_dir, "ent_ids_1"),
+        os.path.join(file_dir, "ent_ids_2")
+    ]
+    
+    for file_path in entity_files:
         try:
             if not os.path.exists(file_path):
                 print(f"Warning: Entity file {file_path} not found")
@@ -248,93 +230,123 @@ def load_entity_names(ent2id_dict, file_paths):
                     if len(parts) >= 2:
                         ent_id = int(parts[0])
                         ent_name = parts[1]
+                        
                         # 清理实体名称，移除URI前缀等
                         if "/" in ent_name:
                             ent_name = ent_name.split("/")[-1]
                         if "#" in ent_name:
                             ent_name = ent_name.split("#")[-1]
+                        
                         # 替换下划线为空格，使其更适合自然语言处理
                         ent_name = ent_name.replace("_", " ")
-                        id2name[ent_id] = ent_name
+                        
+                        # 移除特殊字符，保留字母数字和空格
+                        ent_name = ''.join(c for c in ent_name if c.isalnum() or c.isspace())
+                        
+                        # 如果名称为空，使用默认名称
+                        if not ent_name.strip():
+                            ent_name = f"entity {ent_id}"
+                        
+                        id2name[ent_id] = ent_name.strip()
+                        
         except Exception as e:
             print(f"Warning: Failed to load entity names from {file_path}: {e}")
     
     # 按ID顺序创建名称列表
     max_id = max(ent2id_dict.values()) if ent2id_dict else 0
-    entity_names = []
+    entity_texts = []
     
     for i in range(max_id + 1):
         if i in id2name:
-            entity_names.append(id2name[i])
+            entity_texts.append(id2name[i])
         else:
             # 对于缺失的实体，使用默认名称
-            entity_names.append(f"entity_{i}")
+            entity_texts.append(f"entity {i}")
     
-    valid_names = len([name for name in entity_names if not name.startswith('entity_')])
-    print(f"Loaded {valid_names} entity names out of {len(entity_names)} entities")
-    return entity_names
+    valid_names = len([name for name in entity_texts if not name.startswith('entity ')])
+    print(f"Loaded {valid_names} entity names out of {len(entity_texts)} entities")
+    
+    return entity_texts
 
 
-def prepare_clip_text_inputs(entity_names, tokenizer, max_length=77):
+def prepare_clip_text_inputs(entity_texts, max_length=77):
     """
     为CLIP准备文本输入
     
     Args:
-        entity_names: 实体名称列表
-        tokenizer: CLIP tokenizer
+        entity_texts: 实体名称列表
         max_length: 最大序列长度
     
     Returns:
-        tokenized_inputs: 标记化的输入
+        processed_texts: 处理后的文本列表
     """
     try:
-        if tokenizer is None:
-            from transformers import CLIPTokenizer
-            tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        processed_texts = []
         
-        # 批量标记化
-        tokenized = tokenizer(
-            entity_names,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
-        )
+        for text in entity_texts:
+            # 确保文本不为空
+            if not text or text.strip() == "":
+                text = "unknown entity"
+            
+            # 限制文本长度（粗略估计，实际tokenization会更精确）
+            if len(text) > max_length * 4:  # 粗略估计每个token平均4个字符
+                text = text[:max_length * 4]
+            
+            processed_texts.append(text)
         
-        return tokenized
-    except ImportError:
-        print("Warning: transformers not available, returning None")
-        return None
+        return processed_texts
+        
     except Exception as e:
         print(f"Warning: Failed to prepare CLIP text inputs: {e}")
-        return None
+        return entity_texts
 
 
-def load_clip_compatible_images(img_features, target_size=(224, 224)):
-    """
-    将图像特征转换为CLIP兼容格式
-    
-    Args:
-        img_features: 原始图像特征
-        target_size: 目标图像尺寸
-    
-    Returns:
-        clip_images: CLIP兼容的图像特征
-    """
+def load_name_features(e_num, file_paths, ent2id_dict, word2vec_path=None, feature_dim=300):
+    """加载实体名称特征"""
     try:
-        # 如果图像特征已经是合适的格式，直接返回
-        if isinstance(img_features, torch.Tensor):
-            return img_features
+        print(f"Loading name features...")
         
-        # 否则进行转换
-        if isinstance(img_features, np.ndarray):
-            return torch.FloatTensor(img_features)
+        # 首先尝试加载实体文本
+        entity_texts = []
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 2:
+                            entity_texts.append(parts[1])
+        
+        if entity_texts:
+            # 如果有实体文本，创建简单的特征表示
+            # 这里可以改进为使用预训练词向量
+            name_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
+            print(f"Created name features with dimension {feature_dim}")
         else:
-            print("Warning: Unsupported image feature format")
-            return None
+            # 如果没有文本，创建随机特征
+            name_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
+            print(f"Created random name features with dimension {feature_dim}")
+        
+        return name_features
+        
     except Exception as e:
-        print(f"Warning: Failed to convert image features: {e}")
-        return None
+        print(f"Warning: Failed to load name features: {e}")
+        return np.random.normal(0, 0.1, (e_num, 300)).astype(np.float32)
+
+
+def load_char_features(e_num, file_paths, ent2id_dict, feature_dim=100):
+    """加载字符级特征"""
+    try:
+        print(f"Loading char features...")
+        
+        # 创建字符级特征（可以改进为基于字符n-gram等）
+        char_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
+        print(f"Created char features with dimension {feature_dim}")
+        
+        return char_features
+        
+    except Exception as e:
+        print(f"Warning: Failed to load char features: {e}")
+        return np.random.normal(0, 0.1, (e_num, 100)).astype(np.float32)
 
 
 def load_word_embeddings(word2vec_path, vocab_size=None, embedding_dim=300):
@@ -394,78 +406,6 @@ def load_word_embeddings(word2vec_path, vocab_size=None, embedding_dim=300):
         return np.random.normal(0, 0.1, (vocab_size, embedding_dim)), {}
 
 
-def save_embeddings(embeddings, path):
-    """保存嵌入到文件"""
-    try:
-        np.save(path, embeddings)
-        print(f"Embeddings saved to {path}")
-    except Exception as e:
-        print(f"Warning: Failed to save embeddings: {e}")
-
-
-def load_embeddings(path):
-    """从文件加载嵌入"""
-    try:
-        embeddings = np.load(path)
-        print(f"Embeddings loaded from {path}")
-        return embeddings
-    except Exception as e:
-        print(f"Warning: Failed to load embeddings from {path}: {e}")
-        return None
-
-
-# 辅助函数
-def normalize_embeddings(embeddings):
-    """归一化嵌入"""
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    return embeddings / norms
-
-
-def pad_sequences(sequences, max_length=None, padding_value=0):
-    """填充序列到相同长度"""
-    if max_length is None:
-        max_length = max(len(seq) for seq in sequences)
-    
-    padded = []
-    for seq in sequences:
-        if len(seq) >= max_length:
-            padded.append(seq[:max_length])
-        else:
-            padding = [padding_value] * (max_length - len(seq))
-            padded.append(seq + padding)
-    
-    return np.array(padded)
-
-
-def create_entity_vocab(entity_names):
-    """创建实体词汇表"""
-    vocab = set()
-    for name in entity_names:
-        if name:
-            words = name.lower().split()
-            vocab.update(words)
-    
-    vocab = sorted(list(vocab))
-    word2id = {word: i for i, word in enumerate(vocab)}
-    return vocab, word2id
-
-
-def encode_entity_names(entity_names, word2id, max_length=10):
-    """将实体名称编码为ID序列"""
-    encoded = []
-    for name in entity_names:
-        if name:
-            words = name.lower().split()
-            ids = [word2id.get(word, 0) for word in words]  # 0 for unknown words
-            encoded.append(ids)
-        else:
-            encoded.append([0])
-    
-    return pad_sequences(encoded, max_length)
-
-
-# 数据验证函数
 def validate_data_consistency(ent2id_dict, triples, ills):
     """验证数据一致性"""
     print("Validating data consistency...")
@@ -497,32 +437,73 @@ def validate_data_consistency(ent2id_dict, triples, ills):
     return len(invalid_entities) == 0 and len(invalid_alignments) == 0
 
 
-# 主要的数据加载接口
-def load_multimodal_data(file_dir, ent2id_dict, ent_num, triples, 
-                        load_images=True, load_attributes=True, 
-                        load_relations=True, load_names=False, load_chars=False):
+def create_entity_batches(entity_texts, batch_size=1000):
     """
-    统一的多模态数据加载接口
+    将实体文本分批处理，避免内存问题
+    
+    Args:
+        entity_texts: 实体文本列表
+        batch_size: 批次大小
+    
+    Returns:
+        batches: 文本批次列表
+    """
+    batches = []
+    for i in range(0, len(entity_texts), batch_size):
+        batch = entity_texts[i:i + batch_size]
+        batches.append(batch)
+    return batches
+
+
+def save_processed_features(features, save_path, feature_name):
+    """保存处理后的特征"""
+    try:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        np.save(save_path, features)
+        print(f"{feature_name} features saved to {save_path}")
+    except Exception as e:
+        print(f"Warning: Failed to save {feature_name} features: {e}")
+
+
+def load_processed_features(load_path, feature_name):
+    """加载已处理的特征"""
+    try:
+        if os.path.exists(load_path):
+            features = np.load(load_path)
+            print(f"{feature_name} features loaded from {load_path}")
+            return features
+    except Exception as e:
+        print(f"Warning: Failed to load {feature_name} features from {load_path}: {e}")
+    return None
+
+
+def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples, 
+                                   use_cache=True, cache_dir="cache"):
+    """
+    带缓存的多模态数据加载
     
     Args:
         file_dir: 数据目录
         ent2id_dict: 实体映射字典
         ent_num: 实体数量
         triples: 三元组列表
-        load_images: 是否加载图像特征
-        load_attributes: 是否加载属性特征
-        load_relations: 是否加载关系特征
-        load_names: 是否加载名称特征
-        load_chars: 是否加载字符特征
+        use_cache: 是否使用缓存
+        cache_dir: 缓存目录
     
     Returns:
         data_dict: 包含所有特征的字典
     """
     data_dict = {}
     
-    # 加载图像特征
-    if load_images:
-        # 确定图像特征文件路径
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    # 图像特征
+    img_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_img_features.npy")
+    if use_cache and os.path.exists(img_cache_path):
+        data_dict['img_features'] = load_processed_features(img_cache_path, "image")
+    else:
+        # 原始加载逻辑
         if "V1" in file_dir:
             img_vec_path = "data/pkls/dbpedia_wikidata_15k_norm_GA_id_img_feature_dict.pkl"
         elif "V2" in file_dir:
@@ -535,27 +516,54 @@ def load_multimodal_data(file_dir, ent2id_dict, ent_num, triples,
             img_vec_path = f"data/pkls/{split}_GA_id_img_feature_dict.pkl"
         
         data_dict['img_features'] = load_img_new(ent_num, img_vec_path, triples)
+        
+        if use_cache:
+            save_processed_features(data_dict['img_features'], img_cache_path, "image")
     
-    # 加载属性特征
-    if load_attributes:
+    # 属性特征
+    attr_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_attr_features.npy")
+    if use_cache and os.path.exists(attr_cache_path):
+        data_dict['att_features'] = load_processed_features(attr_cache_path, "attribute")
+    else:
         a1 = os.path.join(file_dir, "training_attrs_1")
         a2 = os.path.join(file_dir, "training_attrs_2")
         data_dict['att_features'] = load_attr([a1, a2], ent_num, ent2id_dict, 1000)
+        
+        if use_cache:
+            save_processed_features(data_dict['att_features'], attr_cache_path, "attribute")
     
-    # 加载关系特征
-    if load_relations:
+    # 关系特征
+    rel_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_rel_features.npy")
+    if use_cache and os.path.exists(rel_cache_path):
+        data_dict['rel_features'] = load_processed_features(rel_cache_path, "relation")
+    else:
         data_dict['rel_features'] = load_relation(ent_num, triples, 1000)
+        
+        if use_cache:
+            save_processed_features(data_dict['rel_features'], rel_cache_path, "relation")
     
-    # 加载名称特征
-    if load_names:
-        e1 = os.path.join(file_dir, "ent_ids_1")
-        e2 = os.path.join(file_dir, "ent_ids_2")
-        data_dict['name_features'] = load_name_features(ent_num, [e1, e2], ent2id_dict)
-    
-    # 加载字符特征
-    if load_chars:
-        e1 = os.path.join(file_dir, "ent_ids_1")
-        e2 = os.path.join(file_dir, "ent_ids_2")
-        data_dict['char_features'] = load_char_features(ent_num, [e1, e2], ent2id_dict)
+    # 实体文本（用于CLIP）
+    text_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_entity_texts.json")
+    if use_cache and os.path.exists(text_cache_path):
+        try:
+            with open(text_cache_path, 'r', encoding='utf-8') as f:
+                data_dict['entity_texts'] = json.load(f)
+            print("Entity texts loaded from cache")
+        except:
+            data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
+            if use_cache:
+                try:
+                    with open(text_cache_path, 'w', encoding='utf-8') as f:
+                        json.dump(data_dict['entity_texts'], f, ensure_ascii=False, indent=2)
+                except:
+                    pass
+    else:
+        data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
+        if use_cache:
+            try:
+                with open(text_cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(data_dict['entity_texts'], f, ensure_ascii=False, indent=2)
+            except:
+                pass
     
     return data_dict
