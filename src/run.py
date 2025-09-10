@@ -181,17 +181,17 @@ class IBMEA:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dataset = os.path.basename(self.args.file_dir)
         
-        exp_name = f"{dataset}_{timestamp}"
+        exp_name = f"enhanced_{dataset}_{timestamp}"
         if self.args.use_clip:
             exp_name += "_clip"
         if self.args.use_entity_names:
             exp_name += "_names"
-        if getattr(self.args, 'clip_freeze', True):
-            exp_name += "_frozen"
-        else:
-            exp_name += "_finetune"
+        if getattr(self.args, 'structure_encoder', '') == 'gnn_enhanced':
+            exp_name += "_enhanced_gnn"
+        if getattr(self.args, 'use_comprehensive_loss', False):
+            exp_name += "_comprehensive"
             
-        # 创建logs文件夹（与src同级）
+        # 创建logs文件夹
         logs_dir = "logs"
         os.makedirs(logs_dir, exist_ok=True)
         
@@ -262,7 +262,7 @@ class IBMEA:
             "--structure_encoder",
             type=str,
             default="gat",
-            help="the encoder of structure view, [gcn|gat]",
+            help="the encoder of structure view, [gcn|gat|gnn_enhanced]",
         )
         
         # 训练参数
@@ -386,8 +386,8 @@ class IBMEA:
         parser.add_argument(
             "--fusion_strategy", 
             type=str, 
-            default="weighted_concat",
-            choices=["weighted_concat", "attention", "simple_concat"],
+            default="simple_concat",
+            choices=["weighted_concat", "attention", "simple_concat", "adaptive"],
             help="fusion strategy for multimodal features"
         )
         
@@ -434,7 +434,8 @@ class IBMEA:
             "--il_start", type=int, default=500, help="If Il, when to start?"
         )
         
-        # === CLIP相关参数 ===
+        # === 增强参数 ===
+        # CLIP相关参数
         parser.add_argument(
             "--use_clip", 
             action="store_true", 
@@ -472,6 +473,52 @@ class IBMEA:
             help="使用实体名称进行CLIP文本编码"
         )
         
+        # 知识增强参数
+        parser.add_argument(
+            "--num_relations", 
+            type=int, 
+            default=10, 
+            help="关系类型数量"
+        )
+        parser.add_argument(
+            "--structure_weight", 
+            type=float, 
+            default=0.3, 
+            help="结构损失权重"
+        )
+        parser.add_argument(
+            "--semantic_weight", 
+            type=float, 
+            default=0.2, 
+            help="语义损失权重"
+        )
+        parser.add_argument(
+            "--knowledge_weight", 
+            type=float, 
+            default=0.1, 
+            help="知识感知损失权重"
+        )
+        
+        # 高级训练参数
+        parser.add_argument(
+            "--use_adaptive_weighting", 
+            action="store_true", 
+            default=False, 
+            help="使用自适应损失权重"
+        )
+        parser.add_argument(
+            "--use_comprehensive_loss",
+            action="store_true",
+            default=False,
+            help="使用综合增强损失函数"
+        )
+        parser.add_argument(
+            "--contrastive_temperature",
+            type=float,
+            default=0.07,
+            help="多模态对比学习温度"
+        )
+        
         # 数据相关参数
         parser.add_argument(
             "--use_mean_img", action="store_true", default=False, help="use_mean_img"
@@ -505,20 +552,6 @@ class IBMEA:
             "--zoom", type=float, default=0.1, help="narrow the range of losses"
         )
         
-        # 高级训练参数
-        parser.add_argument(
-            "--use_adaptive_weighting", 
-            action="store_true", 
-            default=False, 
-            help="use adaptive loss weighting"
-        )
-        parser.add_argument(
-            "--use_comprehensive_loss",
-            action="store_true",
-            default=False,
-            help="use comprehensive loss function"
-        )
-        
         return parser.parse_args()
 
     @staticmethod
@@ -530,14 +563,17 @@ class IBMEA:
             torch.cuda.manual_seed(seed)
 
     def print_summary(self):
-        summary_msg = f"""-----dataset summary-----
+        summary_msg = f"""-----Enhanced Dataset Summary-----
 dataset:\t{self.args.file_dir}
 triple num:\t{len(self.triples)}
 entity num:\t{self.ENT_NUM}
 relation num:\t{self.REL_NUM}
 train ill num:\t{self.train_ill.shape[0]}\ttest ill num:\t{self.test_ill.shape[0]}
+structure encoder:\t{self.args.structure_encoder}
 CLIP enabled:\t{self.args.use_clip}
 Entity names:\t{self.args.use_entity_names}
+Fusion strategy:\t{self.args.fusion_strategy}
+Use comprehensive loss:\t{self.args.use_comprehensive_loss}
 -------------------------"""
         self.log_print(summary_msg)
 
@@ -716,18 +752,10 @@ Entity names:\t{self.args.use_entity_names}
         )
         self.criterion_nce = InfoNCE_loss(device=self.device, temperature=self.args.tau)
         
-        # 初始化综合损失函数
-        if getattr(self.args, 'use_comprehensive_loss', False):
+        # 初始化综合增强损失函数
+        if self.args.use_comprehensive_loss:
             self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
-        
-        # 初始化CLIP损失
-        if self.args.use_clip:
-            self.clip_loss = CLIPAwareContrastiveLoss(
-                device=self.device,
-                temperature=self.args.clip_temperature,
-                clip_weight=self.args.clip_weight,
-                entity_weight=1.0
-            )
+            self.log_print("Using comprehensive enhanced loss function")
         
         self.log_print("Model initialization completed successfully!")
 
@@ -812,8 +840,8 @@ Entity names:\t{self.args.use_entity_names}
             for si in np.arange(0, self.train_ill.shape[0], bsize):
                 current_links = self.train_ill[si : si + bsize]
                 
-                if getattr(self.args, 'use_comprehensive_loss', False):
-                    # 使用综合损失函数
+                if self.args.use_comprehensive_loss and hasattr(self, 'comprehensive_loss'):
+                    # 使用综合增强损失函数
                     embeddings_dict = {
                         'graph': gph_emb,
                         'image': img_emb,
@@ -824,13 +852,16 @@ Entity names:\t{self.args.use_entity_names}
                         'joint': joint_emb
                     }
                     loss_all, loss_components = self.comprehensive_loss(
-                        embeddings_dict, current_links, self.multimodal_encoder
+                        embeddings_dict, current_links, self.multimodal_encoder, self.adj
                     )
                     
                     # 记录各组件损失
                     epoch_info = f"[epoch {epoch:4d}]"
                     for component, loss_val in loss_components.items():
-                        epoch_info += f" {component}:{loss_val:.4f}"
+                        if torch.is_tensor(loss_val):
+                            epoch_info += f" {component}:{loss_val.item():.4f}"
+                        else:
+                            epoch_info += f" {component}:{loss_val:.4f}"
                     
                 else:
                     # 使用传统的分别计算损失方式
@@ -849,7 +880,7 @@ Entity names:\t{self.args.use_entity_names}
                                 loss_list.append(loss_G)
                             except Exception as e:
                                 epoch_info += f" [gph_loss_failed:{str(e)[:20]}]"
-    
+
                     # === 图像损失 ===
                     if self.args.w_img and img_emb is not None:
                         if use_img_vib:
@@ -861,7 +892,7 @@ Entity names:\t{self.args.use_entity_names}
                                 loss_list.append(loss_I)
                             except Exception as e:
                                 epoch_info += f" [img_loss_failed:{str(e)[:20]}]"
-    
+
                     # === 关系损失 ===
                     if self.args.w_rel and rel_emb is not None:
                         if use_rel_vib:
@@ -873,7 +904,7 @@ Entity names:\t{self.args.use_entity_names}
                                 loss_list.append(loss_R)
                             except Exception as e:
                                 epoch_info += f" [rel_loss_failed:{str(e)[:20]}]"
-    
+
                     # === 属性损失 ===
                     if self.args.w_attr and att_emb is not None:
                         if use_attr_vib:
@@ -885,28 +916,7 @@ Entity names:\t{self.args.use_entity_names}
                                 loss_list.append(loss_A)
                             except Exception as e:
                                 epoch_info += f" [attr_loss_failed:{str(e)[:20]}]"
-    
-                    # === CLIP损失 ===
-                    if self.args.use_clip and hasattr(self.multimodal_encoder, 'clip_features'):
-                        try:
-                            embeddings_dict = {
-                                'graph': gph_emb,
-                                'image': img_emb,
-                                'relation': rel_emb,
-                                'attribute': att_emb,
-                                'joint': joint_emb
-                            }
-                            clip_loss = self.clip_loss(
-                                joint_emb,
-                                current_links,
-                                self.multimodal_encoder.clip_features,
-                                embeddings_dict
-                            )
-                            epoch_info += f" clip:{clip_loss:.4f}"
-                            loss_list.append(clip_loss)
-                        except Exception as e:
-                            epoch_info += f" [clip_loss_failed:{str(e)[:20]}]"
-    
+
                     # === 联合损失 ===
                     if joint_emb is not None:
                         if use_joint_vib:
