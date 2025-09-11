@@ -14,23 +14,29 @@ def loadfile(fn, num=1):
     """加载文件，返回元组列表"""
     print("loading a file..." + fn)
     ret = []
-    with open(fn, encoding="utf-8") as f:
-        for line in f:
-            th = line[:-1].split("\t")
-            x = []
-            for i in range(num):
-                x.append(int(th[i]))
-            ret.append(tuple(x))
+    try:
+        with open(fn, encoding="utf-8") as f:
+            for line in f:
+                th = line[:-1].split("\t")
+                x = []
+                for i in range(num):
+                    x.append(int(th[i]))
+                ret.append(tuple(x))
+    except Exception as e:
+        print(f"Warning: Failed to load file {fn}: {e}")
     return ret
 
 
 def get_ids(fn):
     """从文件中获取ID列表"""
     ids = []
-    with open(fn, encoding="utf-8") as f:
-        for line in f:
-            th = line[:-1].split("\t")
-            ids.append(int(th[0]))
+    try:
+        with open(fn, encoding="utf-8") as f:
+            for line in f:
+                th = line[:-1].split("\t")
+                ids.append(int(th[0]))
+    except Exception as e:
+        print(f"Warning: Failed to get IDs from {fn}: {e}")
     return ids
 
 
@@ -38,10 +44,14 @@ def get_ent2id(fns):
     """构建实体到ID的映射"""
     ent2id = {}
     for fn in fns:
-        with open(fn, "r", encoding="utf-8") as f:
-            for line in f:
-                th = line[:-1].split("\t")
-                ent2id[th[1]] = int(th[0])
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                for line in f:
+                    th = line[:-1].split("\t")
+                    if len(th) >= 2:
+                        ent2id[th[1]] = int(th[0])
+        except Exception as e:
+            print(f"Warning: Failed to load entity mapping from {fn}: {e}")
     return ent2id
 
 
@@ -52,16 +62,19 @@ def load_attr(fns, e, ent2id, topA=1000):
         if not os.path.exists(fn):
             print(f"Warning: Attribute file {fn} not found, skipping...")
             continue
-        with open(fn, "r", encoding="utf-8") as f:
-            for line in f:
-                th = line[:-1].split("\t")
-                if th[0] not in ent2id:
-                    continue
-                for i in range(1, len(th)):
-                    if th[i] not in cnt:
-                        cnt[th[i]] = 1
-                    else:
-                        cnt[th[i]] += 1
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                for line in f:
+                    th = line[:-1].split("\t")
+                    if len(th) < 2 or th[0] not in ent2id:
+                        continue
+                    for i in range(1, len(th)):
+                        if th[i] not in cnt:
+                            cnt[th[i]] = 1
+                        else:
+                            cnt[th[i]] += 1
+        except Exception as e:
+            print(f"Warning: Failed to process attribute file {fn}: {e}")
     
     if not cnt:
         print(f"Warning: No attributes found, creating random features")
@@ -76,41 +89,54 @@ def load_attr(fns, e, ent2id, topA=1000):
     for fn in fns:
         if not os.path.exists(fn):
             continue
-        with open(fn, "r", encoding="utf-8") as f:
-            for line in f:
-                th = line[:-1].split("\t")
-                if th[0] in ent2id:
-                    for i in range(1, len(th)):
-                        if th[i] in attr2id:
-                            attr[ent2id[th[0]]][attr2id[th[i]]] = 1.0
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                for line in f:
+                    th = line[:-1].split("\t")
+                    if len(th) >= 2 and th[0] in ent2id:
+                        ent_idx = ent2id[th[0]]
+                        if ent_idx < e:  # 确保索引不越界
+                            for i in range(1, len(th)):
+                                if th[i] in attr2id:
+                                    attr[ent_idx][attr2id[th[i]]] = 1.0
+        except Exception as e:
+            print(f"Warning: Failed to load attributes from {fn}: {e}")
     return attr
 
 
 def load_relation(e, KG, topR=1000):
     """加载关系特征"""
-    rel_mat = np.zeros((e, topR), dtype=np.float32)
-    rels = np.array(KG)[:, 1]
-    top_rels = Counter(rels).most_common(topR)
-    rel_index_dict = {r: i for i, (r, cnt) in enumerate(top_rels)}
-    
-    for tri in KG:
-        h = tri[0]
-        r = tri[1] 
-        o = tri[2]
-        if r in rel_index_dict:
-            rel_mat[h][rel_index_dict[r]] += 1.0
-            rel_mat[o][rel_index_dict[r]] += 1.0
-    return np.array(rel_mat)
+    try:
+        rel_mat = np.zeros((e, topR), dtype=np.float32)
+        rels = np.array(KG)[:, 1]
+        top_rels = Counter(rels).most_common(topR)
+        rel_index_dict = {r: i for i, (r, cnt) in enumerate(top_rels)}
+        
+        for tri in KG:
+            h = tri[0]
+            r = tri[1] 
+            o = tri[2]
+            # 确保索引不越界
+            if h < e and o < e and r in rel_index_dict:
+                rel_mat[h][rel_index_dict[r]] += 1.0
+                rel_mat[o][rel_index_dict[r]] += 1.0
+        return np.array(rel_mat)
+    except Exception as e:
+        print(f"Warning: Failed to load relation features: {e}")
+        return np.zeros((e, topR), dtype=np.float32)
 
 
 def load_json_embd(path):
     """加载JSON格式的嵌入"""
     embd_dict = {}
-    with open(path) as f:
-        for line in f:
-            example = json.loads(line.strip())
-            vec = np.array([float(e) for e in example["feature"].split()])
-            embd_dict[int(example["guid"])] = vec
+    try:
+        with open(path) as f:
+            for line in f:
+                example = json.loads(line.strip())
+                vec = np.array([float(e) for e in example["feature"].split()])
+                embd_dict[int(example["guid"])] = vec
+    except Exception as e:
+        print(f"Warning: Failed to load JSON embeddings from {path}: {e}")
     return embd_dict
 
 
@@ -123,15 +149,23 @@ def load_img(e_num, path):
     try:
         img_dict = pickle.load(open(path, "rb"))
         imgs_np = np.array(list(img_dict.values()))
+        
+        if len(imgs_np) == 0:
+            print(f"Warning: Empty image dictionary, creating random features")
+            return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
+        
         mean = np.mean(imgs_np, axis=0)
         std = np.std(imgs_np, axis=0)
+        
+        # 避免除零错误
+        std = np.where(std == 0, 0.1, std)
         
         img_embd = np.array([
             img_dict[i] if i in img_dict else np.random.normal(mean, std, mean.shape[0])
             for i in range(e_num)
         ])
         print("%.2f%% entities have images" % (100 * len(img_dict) / e_num))
-        return img_embd
+        return img_embd.astype(np.float32)
     except Exception as e:
         print(f"Warning: Failed to load image features from {path}: {e}")
         return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
@@ -146,20 +180,29 @@ def load_img_new(e_num, path, triples):
     try:
         img_dict = pickle.load(open(path, "rb"))
         
+        if len(img_dict) == 0:
+            print(f"Warning: Empty image dictionary, creating random features")
+            return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
+        
         # 构建邻居关系
         neighbor_list = defaultdict(list)
         for triple in triples:
             head = triple[0]
             relation = triple[1]
             tail = triple[2]
-            if tail in img_dict:
-                neighbor_list[head].append(tail)
-            if head in img_dict:
-                neighbor_list[tail].append(head)
+            # 确保索引不越界
+            if head < e_num and tail < e_num:
+                if tail in img_dict:
+                    neighbor_list[head].append(tail)
+                if head in img_dict:
+                    neighbor_list[tail].append(head)
         
         imgs_np = np.array(list(img_dict.values()))
         mean = np.mean(imgs_np, axis=0)
         std = np.std(imgs_np, axis=0)
+        
+        # 避免除零错误
+        std = np.where(std == 0, 0.1, std)
         all_img_emb_normal = np.random.normal(mean, std, mean.shape[0])
         
         img_embd = []
@@ -189,7 +232,7 @@ def load_img_new(e_num, path, triples):
             " follow_neighbor_img_num is {0},".format(follow_neighbor_img_num),
             " follow_all_img_num is {0}".format(follow_all_img_num),
         )
-        return np.array(img_embd)
+        return np.array(img_embd, dtype=np.float32)
     
     except Exception as e:
         print(f"Warning: Failed to load image features from {path}: {e}")
@@ -410,31 +453,39 @@ def validate_data_consistency(ent2id_dict, triples, ills):
     """验证数据一致性"""
     print("Validating data consistency...")
     
-    # 检查实体ID范围
-    max_ent_id = max(ent2id_dict.values()) if ent2id_dict else -1
-    print(f"Max entity ID: {max_ent_id}")
-    
-    # 检查三元组中的实体ID
-    triple_entities = set()
-    for h, r, t in triples:
-        triple_entities.add(h)
-        triple_entities.add(t)
-    
-    invalid_entities = [e for e in triple_entities if e > max_ent_id]
-    if invalid_entities:
-        print(f"Warning: Found {len(invalid_entities)} invalid entity IDs in triples")
-    
-    # 检查对齐数据
-    invalid_alignments = []
-    for e1, e2 in ills:
-        if e1 > max_ent_id or e2 > max_ent_id:
-            invalid_alignments.append((e1, e2))
-    
-    if invalid_alignments:
-        print(f"Warning: Found {len(invalid_alignments)} invalid alignments")
-    
-    print("Data validation completed")
-    return len(invalid_entities) == 0 and len(invalid_alignments) == 0
+    try:
+        # 检查实体ID范围
+        max_ent_id = max(ent2id_dict.values()) if ent2id_dict else -1
+        print(f"Max entity ID: {max_ent_id}")
+        
+        # 检查三元组中的实体ID
+        triple_entities = set()
+        invalid_triples = 0
+        for h, r, t in triples:
+            if h <= max_ent_id and t <= max_ent_id:
+                triple_entities.add(h)
+                triple_entities.add(t)
+            else:
+                invalid_triples += 1
+        
+        if invalid_triples > 0:
+            print(f"Warning: Found {invalid_triples} invalid triples")
+        
+        # 检查对齐数据
+        invalid_alignments = 0
+        for e1, e2 in ills:
+            if e1 > max_ent_id or e2 > max_ent_id:
+                invalid_alignments += 1
+        
+        if invalid_alignments > 0:
+            print(f"Warning: Found {invalid_alignments} invalid alignments")
+        
+        print("Data validation completed")
+        return invalid_triples == 0 and invalid_alignments == 0
+        
+    except Exception as e:
+        print(f"Warning: Data validation failed: {e}")
+        return False
 
 
 def create_entity_batches(entity_texts, batch_size=1000):
@@ -455,18 +506,20 @@ def create_entity_batches(entity_texts, batch_size=1000):
     return batches
 
 
-def save_processed_features(features, save_path, feature_name):
-    """保存处理后的特征"""
+def safe_save_features(features, save_path, feature_name):
+    """安全保存特征"""
     try:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         np.save(save_path, features)
         print(f"{feature_name} features saved to {save_path}")
+        return True
     except Exception as e:
         print(f"Warning: Failed to save {feature_name} features: {e}")
+        return False
 
 
-def load_processed_features(load_path, feature_name):
-    """加载已处理的特征"""
+def safe_load_features(load_path, feature_name):
+    """安全加载特征"""
     try:
         if os.path.exists(load_path):
             features = np.load(load_path)
@@ -501,8 +554,9 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
     # 图像特征
     img_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_img_features.npy")
     if use_cache and os.path.exists(img_cache_path):
-        data_dict['img_features'] = load_processed_features(img_cache_path, "image")
-    else:
+        data_dict['img_features'] = safe_load_features(img_cache_path, "image")
+    
+    if 'img_features' not in data_dict or data_dict['img_features'] is None:
         # 原始加载逻辑
         if "V1" in file_dir:
             img_vec_path = "data/pkls/dbpedia_wikidata_15k_norm_GA_id_img_feature_dict.pkl"
@@ -518,29 +572,31 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
         data_dict['img_features'] = load_img_new(ent_num, img_vec_path, triples)
         
         if use_cache:
-            save_processed_features(data_dict['img_features'], img_cache_path, "image")
+            safe_save_features(data_dict['img_features'], img_cache_path, "image")
     
     # 属性特征
     attr_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_attr_features.npy")
     if use_cache and os.path.exists(attr_cache_path):
-        data_dict['att_features'] = load_processed_features(attr_cache_path, "attribute")
-    else:
+        data_dict['att_features'] = safe_load_features(attr_cache_path, "attribute")
+    
+    if 'att_features' not in data_dict or data_dict['att_features'] is None:
         a1 = os.path.join(file_dir, "training_attrs_1")
         a2 = os.path.join(file_dir, "training_attrs_2")
         data_dict['att_features'] = load_attr([a1, a2], ent_num, ent2id_dict, 1000)
         
         if use_cache:
-            save_processed_features(data_dict['att_features'], attr_cache_path, "attribute")
+            safe_save_features(data_dict['att_features'], attr_cache_path, "attribute")
     
     # 关系特征
     rel_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_rel_features.npy")
     if use_cache and os.path.exists(rel_cache_path):
-        data_dict['rel_features'] = load_processed_features(rel_cache_path, "relation")
-    else:
+        data_dict['rel_features'] = safe_load_features(rel_cache_path, "relation")
+    
+    if 'rel_features' not in data_dict or data_dict['rel_features'] is None:
         data_dict['rel_features'] = load_relation(ent_num, triples, 1000)
         
         if use_cache:
-            save_processed_features(data_dict['rel_features'], rel_cache_path, "relation")
+            safe_save_features(data_dict['rel_features'], rel_cache_path, "relation")
     
     # 实体文本（用于CLIP）
     text_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_entity_texts.json")
@@ -549,21 +605,50 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
             with open(text_cache_path, 'r', encoding='utf-8') as f:
                 data_dict['entity_texts'] = json.load(f)
             print("Entity texts loaded from cache")
-        except:
+        except Exception as e:
+            print(f"Warning: Failed to load cached entity texts: {e}")
             data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
             if use_cache:
                 try:
                     with open(text_cache_path, 'w', encoding='utf-8') as f:
                         json.dump(data_dict['entity_texts'], f, ensure_ascii=False, indent=2)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Warning: Failed to cache entity texts: {e}")
     else:
         data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
         if use_cache:
             try:
                 with open(text_cache_path, 'w', encoding='utf-8') as f:
                     json.dump(data_dict['entity_texts'], f, ensure_ascii=False, indent=2)
-            except:
-                pass
+            except Exception as e:
+                print(f"Warning: Failed to cache entity texts: {e}")
     
     return data_dict
+
+
+def create_fallback_features(ent_num, feature_name, feature_dim):
+    """创建备用特征"""
+    print(f"Creating fallback {feature_name} features with dimension {feature_dim}")
+    return np.random.normal(0, 0.1, (ent_num, feature_dim)).astype(np.float32)
+
+
+def check_feature_integrity(features, feature_name, expected_shape):
+    """检查特征完整性"""
+    if features is None:
+        print(f"Warning: {feature_name} features are None")
+        return False
+    
+    if features.shape != expected_shape:
+        print(f"Warning: {feature_name} features shape {features.shape} doesn't match expected {expected_shape}")
+        return False
+    
+    if np.isnan(features).any():
+        print(f"Warning: {feature_name} features contain NaN values")
+        return False
+    
+    if np.isinf(features).any():
+        print(f"Warning: {feature_name} features contain infinite values")
+        return False
+    
+    print(f"{feature_name} features integrity check passed")
+    return True

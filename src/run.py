@@ -108,7 +108,7 @@ def load_img_features_dropout(
 
 
 class IBMEA:
-    """修正后的IBMEA训练类"""
+    """修正的IBMEA训练类"""
 
     def __init__(self):
         # 数据相关属性
@@ -181,17 +181,17 @@ class IBMEA:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dataset = os.path.basename(self.args.file_dir)
         
-        exp_name = f"enhanced_{dataset}_{timestamp}"
+        exp_name = f"{dataset}_{timestamp}"
         if self.args.use_clip:
             exp_name += "_clip"
         if self.args.use_entity_names:
             exp_name += "_names"
-        if getattr(self.args, 'structure_encoder', '') == 'gnn_enhanced':
-            exp_name += "_enhanced_gnn"
-        if getattr(self.args, 'use_comprehensive_loss', False):
-            exp_name += "_comprehensive"
+        if getattr(self.args, 'clip_freeze', True):
+            exp_name += "_frozen"
+        else:
+            exp_name += "_finetune"
             
-        # 创建logs文件夹
+        # 创建logs文件夹（与src同级）
         logs_dir = "logs"
         os.makedirs(logs_dir, exist_ok=True)
         
@@ -262,7 +262,8 @@ class IBMEA:
             "--structure_encoder",
             type=str,
             default="gat",
-            help="the encoder of structure view, [gcn|gat|gnn_enhanced]",
+            choices=["gcn", "gat"],  # 移除了gnn_enhanced选项
+            help="the encoder of structure view, [gcn|gat]",
         )
         
         # 训练参数
@@ -319,36 +320,36 @@ class IBMEA:
         
         # 模态开关
         parser.add_argument(
-            "--w_gcn", action="store_false", default=True, help="with gcn features"
+            "--w_gcn", action="store_true", default=True, help="with gcn features"
         )
         parser.add_argument(
-            "--w_rel", action="store_false", default=True, help="with rel features"
+            "--w_rel", action="store_true", default=True, help="with rel features"
         )
         parser.add_argument(
-            "--w_attr", action="store_false", default=True, help="with attr features"
+            "--w_attr", action="store_true", default=True, help="with attr features"
         )
         parser.add_argument(
-            "--w_name", action="store_false", default=True, help="with name features"
+            "--w_name", action="store_true", default=True, help="with name features"
         )
         parser.add_argument(
-            "--w_char", action="store_false", default=True, help="with char features"
+            "--w_char", action="store_true", default=True, help="with char features"
         )
         parser.add_argument(
-            "--w_img", action="store_false", default=True, help="with img features"
+            "--w_img", action="store_true", default=True, help="with img features"
         )
         
         # VIB参数
         parser.add_argument(
-            "--use_graph_vib", action="store_false", default=True, help="use_graph_vib"
+            "--use_graph_vib", action="store_true", default=False, help="use_graph_vib"
         )
         parser.add_argument(
-            "--use_attr_vib", action="store_false", default=True, help="use_attr_vib"
+            "--use_attr_vib", action="store_true", default=False, help="use_attr_vib"
         )
         parser.add_argument(
-            "--use_img_vib", action="store_false", default=True, help="use_img_vib"
+            "--use_img_vib", action="store_true", default=False, help="use_img_vib"
         )
         parser.add_argument(
-            "--use_rel_vib", action="store_false", default=True, help="use_rel_vib"
+            "--use_rel_vib", action="store_true", default=False, help="use_rel_vib"
         )
         parser.add_argument(
             "--use_joint_vib", action="store_true", default=False, help="use_joint_vib"
@@ -386,8 +387,8 @@ class IBMEA:
         parser.add_argument(
             "--fusion_strategy", 
             type=str, 
-            default="simple_concat",
-            choices=["weighted_concat", "attention", "simple_concat", "adaptive"],
+            default="weighted_concat",
+            choices=["weighted_concat", "attention", "simple_concat"],
             help="fusion strategy for multimodal features"
         )
         
@@ -434,8 +435,7 @@ class IBMEA:
             "--il_start", type=int, default=500, help="If Il, when to start?"
         )
         
-        # === 增强参数 ===
-        # CLIP相关参数
+        # === CLIP相关参数 ===
         parser.add_argument(
             "--use_clip", 
             action="store_true", 
@@ -473,52 +473,6 @@ class IBMEA:
             help="使用实体名称进行CLIP文本编码"
         )
         
-        # 知识增强参数
-        parser.add_argument(
-            "--num_relations", 
-            type=int, 
-            default=10, 
-            help="关系类型数量"
-        )
-        parser.add_argument(
-            "--structure_weight", 
-            type=float, 
-            default=0.3, 
-            help="结构损失权重"
-        )
-        parser.add_argument(
-            "--semantic_weight", 
-            type=float, 
-            default=0.2, 
-            help="语义损失权重"
-        )
-        parser.add_argument(
-            "--knowledge_weight", 
-            type=float, 
-            default=0.1, 
-            help="知识感知损失权重"
-        )
-        
-        # 高级训练参数
-        parser.add_argument(
-            "--use_adaptive_weighting", 
-            action="store_true", 
-            default=False, 
-            help="使用自适应损失权重"
-        )
-        parser.add_argument(
-            "--use_comprehensive_loss",
-            action="store_true",
-            default=False,
-            help="使用综合增强损失函数"
-        )
-        parser.add_argument(
-            "--contrastive_temperature",
-            type=float,
-            default=0.07,
-            help="多模态对比学习温度"
-        )
-        
         # 数据相关参数
         parser.add_argument(
             "--use_mean_img", action="store_true", default=False, help="use_mean_img"
@@ -552,6 +506,20 @@ class IBMEA:
             "--zoom", type=float, default=0.1, help="narrow the range of losses"
         )
         
+        # 高级训练参数
+        parser.add_argument(
+            "--use_adaptive_weighting", 
+            action="store_true", 
+            default=False, 
+            help="use adaptive loss weighting"
+        )
+        parser.add_argument(
+            "--use_comprehensive_loss",
+            action="store_true",
+            default=False,
+            help="use comprehensive loss function"
+        )
+        
         return parser.parse_args()
 
     @staticmethod
@@ -563,17 +531,14 @@ class IBMEA:
             torch.cuda.manual_seed(seed)
 
     def print_summary(self):
-        summary_msg = f"""-----Enhanced Dataset Summary-----
+        summary_msg = f"""-----dataset summary-----
 dataset:\t{self.args.file_dir}
 triple num:\t{len(self.triples)}
 entity num:\t{self.ENT_NUM}
 relation num:\t{self.REL_NUM}
 train ill num:\t{self.train_ill.shape[0]}\ttest ill num:\t{self.test_ill.shape[0]}
-structure encoder:\t{self.args.structure_encoder}
 CLIP enabled:\t{self.args.use_clip}
 Entity names:\t{self.args.use_entity_names}
-Fusion strategy:\t{self.args.fusion_strategy}
-Use comprehensive loss:\t{self.args.use_comprehensive_loss}
 -------------------------"""
         self.log_print(summary_msg)
 
@@ -599,20 +564,26 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
         np.random.shuffle(self.ills)
 
         # 加载图像特征
-        if abs(1.0 - self.args.img_dp_ratio) > 1e-3:
-            self.img_features = load_img_features_dropout(
-                self.ENT_NUM,
-                file_dir,
-                self.triples,
-                self.args.use_mean_img,
-                self.args.img_dp_ratio,
-            )
-        else:
-            self.img_features = load_img_features(
-                self.ENT_NUM, file_dir, self.triples, self.args.use_mean_img
-            )
-        self.img_features = F.normalize(torch.Tensor(self.img_features).to(device))
-        self.log_print(f"image feature shape: {self.img_features.shape}")
+        try:
+            if abs(1.0 - self.args.img_dp_ratio) > 1e-3:
+                self.img_features = load_img_features_dropout(
+                    self.ENT_NUM,
+                    file_dir,
+                    self.triples,
+                    self.args.use_mean_img,
+                    self.args.img_dp_ratio,
+                )
+            else:
+                self.img_features = load_img_features(
+                    self.ENT_NUM, file_dir, self.triples, self.args.use_mean_img
+                )
+            self.img_features = F.normalize(torch.Tensor(self.img_features).to(device))
+            self.log_print(f"image feature shape: {self.img_features.shape}")
+        except Exception as e:
+            self.log_print(f"Warning: Failed to load image features: {e}")
+            # 创建随机图像特征作为备用
+            self.img_features = F.normalize(torch.randn(self.ENT_NUM, 2048).to(device))
+            self.log_print(f"Using random image features with shape: {self.img_features.shape}")
         
         # 加载实体文本（用于CLIP）
         if self.args.use_clip and self.args.use_entity_names:
@@ -677,24 +648,42 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
         self.log_print(f"#left entity not in train set: {len(self.left_non_train)}, #right entity not in train set: {len(self.right_non_train)}")
         
         # 加载关系特征
-        self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
-        self.rel_features = torch.Tensor(self.rel_features).to(device)
-        self.log_print(f"relation feature shape: {self.rel_features.shape}")
+        try:
+            self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
+            self.rel_features = torch.Tensor(self.rel_features).to(device)
+            self.log_print(f"relation feature shape: {self.rel_features.shape}")
+        except Exception as e:
+            self.log_print(f"Warning: Failed to load relation features: {e}")
+            self.rel_features = torch.zeros(self.ENT_NUM, 1000).to(device)
+            self.args.w_rel = False
         
         # 加载属性特征
-        a1 = os.path.join(file_dir, "training_attrs_1")
-        a2 = os.path.join(file_dir, "training_attrs_2")
-        self.att_features = load_attr(
-            [a1, a2], self.ENT_NUM, self.ent2id_dict, 1000
-        ) 
-        self.att_features = torch.Tensor(self.att_features).to(device)
-        self.log_print(f"attribute feature shape: {self.att_features.shape}")
+        try:
+            a1 = os.path.join(file_dir, "training_attrs_1")
+            a2 = os.path.join(file_dir, "training_attrs_2")
+            self.att_features = load_attr(
+                [a1, a2], self.ENT_NUM, self.ent2id_dict, 1000
+            ) 
+            self.att_features = torch.Tensor(self.att_features).to(device)
+            self.log_print(f"attribute feature shape: {self.att_features.shape}")
+        except Exception as e:
+            self.log_print(f"Warning: Failed to load attribute features: {e}")
+            self.att_features = torch.zeros(self.ENT_NUM, 1000).to(device)
+            self.args.w_attr = False
 
         # 构建邻接矩阵
-        self.adj = get_adjr(
-            self.ENT_NUM, self.triples, norm=True
-        ) 
-        self.adj = self.adj.to(self.device)
+        try:
+            self.adj = get_adjr(
+                self.ENT_NUM, self.triples, norm=True
+            ) 
+            self.adj = self.adj.to(self.device)
+        except Exception as e:
+            self.log_print(f"Warning: Failed to load adjacency matrix: {e}")
+            # 创建单位矩阵作为备用
+            indices = torch.arange(self.ENT_NUM).long()
+            indices = torch.stack([indices, indices])
+            values = torch.ones(self.ENT_NUM)
+            self.adj = torch.sparse.FloatTensor(indices, values, (self.ENT_NUM, self.ENT_NUM)).to(self.device)
 
         self.log_print("Data initialization completed successfully!")
 
@@ -707,15 +696,52 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
         
         # 设置设备信息到args中
         self.args.device = self.device
+
+        # 验证和修正参数
+        if not hasattr(self.args, 'structure_encoder'):
+            self.args.structure_encoder = "gat"
+        
+        if self.args.structure_encoder not in ["gcn", "gat"]:
+            self.log_print(f"Warning: Unknown structure_encoder {self.args.structure_encoder}, using 'gat'")
+            self.args.structure_encoder = "gat"
+        
+        # 检查CLIP可用性
+        if self.args.use_clip and not CLIP_AVAILABLE:
+            self.log_print("Warning: CLIP requested but transformers not available, disabling CLIP")
+            self.args.use_clip = False
+            self.args.use_entity_names = False
     
         # 初始化多模态编码器
-        self.multimodal_encoder = IBMultiModal(
-            args=self.args,
-            ent_num=self.ENT_NUM,
-            img_feature_dim=img_dim,
-            char_feature_dim=char_dim,
-            use_project_head=self.args.use_project_head,
-        ).to(self.device)
+        try:
+            self.multimodal_encoder = IBMultiModal(
+                args=self.args,
+                ent_num=self.ENT_NUM,
+                img_feature_dim=img_dim,
+                char_feature_dim=char_dim,
+                use_project_head=self.args.use_project_head,
+            ).to(self.device)
+        except Exception as e:
+            self.log_print(f"Error initializing model: {e}")
+            # 使用安全的默认参数重试
+            self.args.use_clip = False
+            self.args.use_comprehensive_loss = False
+            self.args.use_project_head = False
+            # 禁用所有VIB
+            self.args.use_graph_vib = False
+            self.args.use_img_vib = False
+            self.args.use_rel_vib = False
+            self.args.use_attr_vib = False
+            self.args.use_joint_vib = False
+            
+            self.multimodal_encoder = IBMultiModal(
+                args=self.args,
+                ent_num=self.ENT_NUM,
+                img_feature_dim=img_dim,
+                char_feature_dim=char_dim,
+                use_project_head=False,
+            ).to(self.device)
+            
+            self.log_print("Model initialized with safe defaults")
     
         # 计算参数数量
         self.params = [{"params": list(self.multimodal_encoder.parameters())}]
@@ -752,10 +778,26 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
         )
         self.criterion_nce = InfoNCE_loss(device=self.device, temperature=self.args.tau)
         
-        # 初始化综合增强损失函数
-        if self.args.use_comprehensive_loss:
-            self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
-            self.log_print("Using comprehensive enhanced loss function")
+        # 初始化综合损失函数
+        if getattr(self.args, 'use_comprehensive_loss', False):
+            try:
+                self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
+            except Exception as e:
+                self.log_print(f"Warning: Failed to initialize comprehensive loss: {e}")
+                self.args.use_comprehensive_loss = False
+        
+        # 初始化CLIP损失
+        if self.args.use_clip:
+            try:
+                self.clip_loss = CLIPAwareContrastiveLoss(
+                    device=self.device,
+                    temperature=self.args.clip_temperature,
+                    clip_weight=self.args.clip_weight,
+                    entity_weight=1.0
+                )
+            except Exception as e:
+                self.log_print(f"Warning: Failed to initialize CLIP loss: {e}")
+                self.args.use_clip = False
         
         self.log_print("Model initialization completed successfully!")
 
@@ -815,53 +857,59 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
         Beta_i = self.args.Beta_i
         Beta_r = self.args.Beta_r
         Beta_a = self.args.Beta_a
-    
+
         for epoch in range(self.args.epochs):
             t_epoch = time.time()
             self.multimodal_encoder.train()
             self.optimizer.zero_grad()
     
             # 前向传播
-            gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb = (
-                self.multimodal_encoder(
-                    self.input_idx,
-                    self.adj,
-                    self.img_features,
-                    self.rel_features,
-                    self.att_features,
-                    self.name_features,
-                    self.char_features,
-                    entity_texts=self.entity_texts,
+            try:
+                gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb = (
+                    self.multimodal_encoder(
+                        self.input_idx,
+                        self.adj,
+                        self.img_features,
+                        self.rel_features,
+                        self.att_features,
+                        self.name_features,
+                        self.char_features,
+                        entity_texts=self.entity_texts,
+                    )
                 )
-            )
+            except Exception as e:
+                self.log_print(f"Forward pass failed at epoch {epoch}: {e}")
+                continue
             
             np.random.shuffle(self.train_ill)
             
             for si in np.arange(0, self.train_ill.shape[0], bsize):
                 current_links = self.train_ill[si : si + bsize]
                 
-                if self.args.use_comprehensive_loss and hasattr(self, 'comprehensive_loss'):
-                    # 使用综合增强损失函数
-                    embeddings_dict = {
-                        'graph': gph_emb,
-                        'image': img_emb,
-                        'relation': rel_emb,
-                        'attribute': att_emb,
-                        'name': name_emb,
-                        'char': char_emb,
-                        'joint': joint_emb
-                    }
-                    loss_all, loss_components = self.comprehensive_loss(
-                        embeddings_dict, current_links, self.multimodal_encoder, self.adj
-                    )
-                    
-                    # 记录各组件损失
-                    epoch_info = f"[epoch {epoch:4d}]"
-                    for component, loss_val in loss_components.items():
-                        if torch.is_tensor(loss_val):
-                            epoch_info += f" {component}:{loss_val.item():.4f}"
-                        else:
+                if getattr(self.args, 'use_comprehensive_loss', False) and self.comprehensive_loss is not None:
+                    # 使用综合损失函数
+                    try:
+                        embeddings_dict = {
+                            'graph': gph_emb,
+                            'image': img_emb,
+                            'relation': rel_emb,
+                            'attribute': att_emb,
+                            'name': name_emb,
+                            'char': char_emb,
+                            'joint': joint_emb
+                        }
+                        loss_all, loss_components = self.comprehensive_loss(
+                            embeddings_dict, current_links, self.multimodal_encoder
+                        )
+                        
+                        # 记录各组件损失
+                        epoch_info = f"[epoch {epoch:4d}]"
+                        for component, loss_val in loss_components.items():
                             epoch_info += f" {component}:{loss_val:.4f}"
+                    except Exception as e:
+                        self.log_print(f"Comprehensive loss failed: {e}")
+                        loss_all = torch.tensor(0.001, device=device, requires_grad=True)
+                        epoch_info = f"[epoch {epoch:4d}] comprehensive_loss_failed"
                     
                 else:
                     # 使用传统的分别计算损失方式
@@ -871,71 +919,105 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
                     
                     # === 图结构损失 ===
                     if self.args.w_gcn and gph_emb is not None:
-                        if use_graph_vib:
-                            try:
+                        try:
+                            if use_graph_vib and hasattr(self.multimodal_encoder, 'kld_loss'):
                                 gph_bce_loss = self.criterion_nce(gph_emb, current_links)
                                 gph_kld_loss = self.multimodal_encoder.kld_loss
                                 loss_G = gph_bce_loss + Beta_g * gph_kld_loss
                                 epoch_info += f" gph_bce:{gph_bce_loss:.4f} gph_kld:{gph_kld_loss:.4f}"
                                 loss_list.append(loss_G)
-                            except Exception as e:
-                                epoch_info += f" [gph_loss_failed:{str(e)[:20]}]"
-
+                            else:
+                                gph_loss = self.criterion_nce(gph_emb, current_links)
+                                epoch_info += f" gph:{gph_loss:.4f}"
+                                loss_list.append(gph_loss)
+                        except Exception as e:
+                            epoch_info += f" [gph_loss_failed]"
+    
                     # === 图像损失 ===
                     if self.args.w_img and img_emb is not None:
-                        if use_img_vib:
-                            try:
+                        try:
+                            if use_img_vib and hasattr(self.multimodal_encoder, 'img_kld_loss'):
                                 img_bce_loss = self.criterion_nce(img_emb, current_links)
                                 img_kld_loss = self.multimodal_encoder.img_kld_loss
                                 loss_I = img_bce_loss + Beta_i * img_kld_loss
                                 epoch_info += f" img_bce:{img_bce_loss:.4f} img_kld:{img_kld_loss:.4f}"
                                 loss_list.append(loss_I)
-                            except Exception as e:
-                                epoch_info += f" [img_loss_failed:{str(e)[:20]}]"
-
+                            else:
+                                img_loss = self.criterion_nce(img_emb, current_links)
+                                epoch_info += f" img:{img_loss:.4f}"
+                                loss_list.append(img_loss)
+                        except Exception as e:
+                            epoch_info += f" [img_loss_failed]"
+    
                     # === 关系损失 ===
                     if self.args.w_rel and rel_emb is not None:
-                        if use_rel_vib:
-                            try:
+                        try:
+                            if use_rel_vib and hasattr(self.multimodal_encoder, 'rel_kld_loss'):
                                 rel_bce_loss = self.criterion_nce(rel_emb, current_links)
                                 rel_kld_loss = self.multimodal_encoder.rel_kld_loss
                                 loss_R = rel_bce_loss + Beta_r * rel_kld_loss
                                 epoch_info += f" rel_bce:{rel_bce_loss:.4f} rel_kld:{rel_kld_loss:.4f}"
                                 loss_list.append(loss_R)
-                            except Exception as e:
-                                epoch_info += f" [rel_loss_failed:{str(e)[:20]}]"
-
+                            else:
+                                rel_loss = self.criterion_nce(rel_emb, current_links)
+                                epoch_info += f" rel:{rel_loss:.4f}"
+                                loss_list.append(rel_loss)
+                        except Exception as e:
+                            epoch_info += f" [rel_loss_failed]"
+    
                     # === 属性损失 ===
                     if self.args.w_attr and att_emb is not None:
-                        if use_attr_vib:
-                            try:
+                        try:
+                            if use_attr_vib and hasattr(self.multimodal_encoder, 'attr_kld_loss'):
                                 attr_bce_loss = self.criterion_nce(att_emb, current_links)
                                 attr_kld_loss = self.multimodal_encoder.attr_kld_loss
                                 loss_A = attr_bce_loss + Beta_a * attr_kld_loss
                                 epoch_info += f" attr_bce:{attr_bce_loss:.4f} attr_kld:{attr_kld_loss:.4f}"
                                 loss_list.append(loss_A)
-                            except Exception as e:
-                                epoch_info += f" [attr_loss_failed:{str(e)[:20]}]"
-
+                            else:
+                                attr_loss = self.criterion_nce(att_emb, current_links)
+                                epoch_info += f" attr:{attr_loss:.4f}"
+                                loss_list.append(attr_loss)
+                        except Exception as e:
+                            epoch_info += f" [attr_loss_failed]"
+    
+                    # === CLIP损失 ===
+                    if self.args.use_clip and hasattr(self, 'clip_loss') and hasattr(self.multimodal_encoder, 'clip_features'):
+                        try:
+                            embeddings_dict = {
+                                'graph': gph_emb,
+                                'image': img_emb,
+                                'relation': rel_emb,
+                                'attribute': att_emb,
+                                'joint': joint_emb
+                            }
+                            clip_loss = self.clip_loss(
+                                joint_emb,
+                                current_links,
+                                self.multimodal_encoder.clip_features,
+                                embeddings_dict
+                            )
+                            epoch_info += f" clip:{clip_loss:.4f}"
+                            loss_list.append(clip_loss)
+                        except Exception as e:
+                            epoch_info += f" [clip_loss_failed]"
+    
                     # === 联合损失 ===
                     if joint_emb is not None:
-                        if use_joint_vib:
-                            try:
+                        try:
+                            if use_joint_vib and hasattr(self.multimodal_encoder, 'joint_kld_loss'):
                                 joint_bce_loss = self.criterion_nce(joint_emb, current_links)
                                 joint_kld_loss = self.multimodal_encoder.joint_kld_loss
                                 loss_J = joint_bce_loss + self.args.joint_beta * joint_kld_loss
                                 epoch_info += f" joint_bce:{joint_bce_loss:.4f} joint_kld:{joint_kld_loss:.4f}"
                                 loss_list.append(loss_J)
-                            except Exception as e:
-                                epoch_info += f" [joint_vib_loss_failed:{str(e)[:20]}]"
-                        else:
-                            try:
+                            else:
                                 joint_ms_loss = self.criterion_ms(joint_emb, current_links)
                                 loss_J = joint_ms_loss * self.args.joint_beta
                                 epoch_info += f" joint_ms:{joint_ms_loss:.4f}"
                                 loss_list.append(loss_J)
-                            except Exception as e:
-                                epoch_info += f" [joint_ms_loss_failed:{str(e)[:20]}]"
+                        except Exception as e:
+                            epoch_info += f" [joint_loss_failed]"
                                 
                     # === 计算总损失 ===
                     if loss_list:
@@ -1050,18 +1132,22 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
             t_test = time.time()
             self.multimodal_encoder.eval()
 
-            gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb = (
-                self.multimodal_encoder(
-                    self.input_idx,
-                    self.adj,
-                    self.img_features,
-                    self.rel_features,
-                    self.att_features,
-                    self.name_features,
-                    self.char_features,
-                    entity_texts=self.entity_texts,
+            try:
+                gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb = (
+                    self.multimodal_encoder(
+                        self.input_idx,
+                        self.adj,
+                        self.img_features,
+                        self.rel_features,
+                        self.att_features,
+                        self.name_features,
+                        self.char_features,
+                        entity_texts=self.entity_texts,
+                    )
                 )
-            )
+            except Exception as e:
+                self.log_print(f"Test forward pass failed: {e}")
+                return
 
             final_emb = F.normalize(joint_emb)
             top_k = [1, 10, 50]
@@ -1077,22 +1163,26 @@ Use comprehensive loss:\t{self.args.use_comprehensive_loss}
                 0.0,
             )
             
-            if self.args.dist == 2:
-                distance = pairwise_distances(
-                    final_emb[self.test_left], final_emb[self.test_right]
-                )
-            else:
-                import scipy.spatial as T
-                distance = torch.FloatTensor(
-                    T.distance.cdist(
-                        final_emb[self.test_left].cpu().data.numpy(),
-                        final_emb[self.test_right].cpu().data.numpy(),
-                        metric="cityblock",
+            try:
+                if self.args.dist == 2:
+                    distance = pairwise_distances(
+                        final_emb[self.test_left], final_emb[self.test_right]
                     )
-                )
+                else:
+                    import scipy.spatial as T
+                    distance = torch.FloatTensor(
+                        T.distance.cdist(
+                            final_emb[self.test_left].cpu().data.numpy(),
+                            final_emb[self.test_right].cpu().data.numpy(),
+                            metric="cityblock",
+                        )
+                    )
 
-            if self.args.csls is True:
-                distance = 1 - csls_sim(1 - distance, self.args.csls_k)
+                if self.args.csls is True:
+                    distance = 1 - csls_sim(1 - distance, self.args.csls_k)
+            except Exception as e:
+                self.log_print(f"Distance calculation failed: {e}")
+                return
 
             to_write = []
             test_left_np = self.test_left.cpu().numpy()

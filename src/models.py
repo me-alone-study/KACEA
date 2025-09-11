@@ -100,111 +100,82 @@ class SimpleGAT(nn.Module):
         return output
 
 
-class EnhancedCLIPEncoder(nn.Module):
-    """增强的CLIP编码器，支持领域自适应"""
+class CLIPEntityEncoder(nn.Module):
+    """修正的CLIP实体编码器"""
     
-    def __init__(self, clip_model_name="openai/clip-vit-base-patch32", 
-                 freeze_clip=True, device=None, 
-                 text_projection_dim=512, image_projection_dim=512):
-        super(EnhancedCLIPEncoder, self).__init__()
+    def __init__(self, clip_model_name="openai/clip-vit-base-patch32", freeze_clip=True, device=None):
+        super(CLIPEntityEncoder, self).__init__()
         
         if not CLIP_AVAILABLE:
-            print("Warning: CLIP not available, using dummy encoder")
-            self.clip_available = False
-            return
+            raise ImportError("transformers library required for CLIP")
         
-        self.clip_available = True
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        try:
-            # 加载预训练的CLIP模型
-            self.clip_model = CLIPModel.from_pretrained(clip_model_name)
-            self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
-            self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
-            
-            # 移动到指定设备
-            self.clip_model = self.clip_model.to(self.device)
-            
-            # 是否冻结CLIP参数
-            if freeze_clip:
-                for param in self.clip_model.parameters():
-                    param.requires_grad = False
-            
-            # CLIP输出维度
-            self.clip_dim = self.clip_model.config.projection_dim
-            
-            # 领域自适应层
-            self.text_adapter = nn.Sequential(
-                nn.Linear(self.clip_dim, text_projection_dim),
-                nn.LayerNorm(text_projection_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ).to(self.device)
-            
-            self.image_adapter = nn.Sequential(
-                nn.Linear(self.clip_dim, image_projection_dim),
-                nn.LayerNorm(image_projection_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ).to(self.device)
-            
-        except Exception as e:
-            print(f"Warning: CLIP initialization failed: {e}")
-            self.clip_available = False
-    
+        # 加载预训练的CLIP模型
+        self.clip_model = CLIPModel.from_pretrained(clip_model_name)
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+        self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+        
+        # 移动到指定设备
+        self.clip_model = self.clip_model.to(self.device)
+        
+        # 是否冻结CLIP参数
+        if freeze_clip:
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
+        
+        # CLIP输出维度
+        self.clip_dim = self.clip_model.config.projection_dim  # 通常是512
+        
+        # 图像特征投影层 - 延迟初始化
+        self.image_projection = None
+        
     def encode_images(self, image_features):
-        """编码图像特征"""
-        if not self.clip_available:
-            return image_features  # 直接返回原特征
-            
-        # 投影到CLIP维度
-        if not hasattr(self, 'image_projection'):
-            input_dim = image_features.size(-1)
+        """编码图像特征 - 修复维度匹配问题"""
+        # 创建自适应投影层
+        input_dim = image_features.size(-1)
+        if self.image_projection is None or self.image_projection.in_features != input_dim:
             self.image_projection = nn.Linear(input_dim, self.clip_dim).to(self.device)
         
         projected = self.image_projection(image_features)
-        clip_features = F.normalize(projected, dim=-1)
-        
-        # 领域自适应
-        adapted_features = self.image_adapter(clip_features)
-        return adapted_features
+        return F.normalize(projected, dim=-1)
     
     def encode_texts(self, texts):
         """编码文本"""
-        if not self.clip_available or texts is None:
-            # 返回随机特征作为fallback
-            batch_size = len(texts) if isinstance(texts, list) else 1
-            return torch.randn(batch_size, 512, device=self.device)
-            
         if isinstance(texts, str):
             texts = [texts]
         
-        try:
-            # 使用CLIP tokenizer处理文本
-            inputs = self.clip_tokenizer(
-                texts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=77
-            )
-            
-            # 移动到正确的设备
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # 获取文本嵌入
-            with torch.no_grad():
-                text_outputs = self.clip_model.get_text_features(**inputs)
-            
-            clip_features = F.normalize(text_outputs, dim=-1)
-            
-            # 领域自适应
-            adapted_features = self.text_adapter(clip_features)
-            return adapted_features
-        except Exception as e:
-            print(f"Warning: Text encoding failed: {e}")
-            batch_size = len(texts)
-            return torch.randn(batch_size, 512, device=self.device)
+        # 处理批量文本
+        if len(texts) > 1000:  # 如果文本太多，分批处理
+            batch_size = 1000
+            all_embeddings = []
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i+batch_size]
+                batch_embeddings = self._encode_text_batch(batch_texts)
+                all_embeddings.append(batch_embeddings)
+            return torch.cat(all_embeddings, dim=0)
+        else:
+            return self._encode_text_batch(texts)
+    
+    def _encode_text_batch(self, texts):
+        """编码一批文本"""
+        # 使用CLIP tokenizer处理文本
+        inputs = self.clip_tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True,
+            max_length=77
+        )
+        
+        # 移动到正确的设备
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # 获取文本嵌入
+        with torch.no_grad():
+            text_outputs = self.clip_model.get_text_features(**inputs)
+        
+        return F.normalize(text_outputs, dim=-1)
     
     def forward(self, image_features=None, texts=None):
         """前向传播"""
@@ -219,124 +190,8 @@ class EnhancedCLIPEncoder(nn.Module):
         return results
 
 
-class KnowledgeAwareAlignment(nn.Module):
-    """知识感知的跨模态对齐机制"""
-    
-    def __init__(self, feature_dim, num_heads=8, dropout=0.1):
-        super(KnowledgeAwareAlignment, self).__init__()
-        self.feature_dim = feature_dim
-        
-        # 跨模态注意力
-        self.cross_attention = nn.MultiheadAttention(
-            feature_dim, num_heads, dropout=dropout
-        )
-        
-        # 知识门控机制
-        self.knowledge_gate = nn.Sequential(
-            nn.Linear(feature_dim * 2, feature_dim),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, text_features, image_features, graph_features):
-        """
-        Args:
-            text_features: [N, D] 文本特征
-            image_features: [N, D] 图像特征
-            graph_features: [N, D] 图结构特征
-        """
-        if graph_features is None:
-            # 没有图特征时，直接融合文本和图像
-            if text_features is not None and image_features is not None:
-                combined = torch.cat([text_features, image_features], dim=-1)
-                gate = self.knowledge_gate(combined)
-                return gate * text_features + (1 - gate) * image_features
-            elif text_features is not None:
-                return text_features
-            else:
-                return image_features
-        
-        aligned_features = []
-        
-        if text_features is not None:
-            # 使用图结构信息指导文本特征
-            try:
-                attended_text, _ = self.cross_attention(
-                    text_features.unsqueeze(1), 
-                    graph_features.unsqueeze(1), 
-                    graph_features.unsqueeze(1)
-                )
-                aligned_features.append(attended_text.squeeze(1))
-            except:
-                aligned_features.append(text_features)
-        
-        if image_features is not None:
-            # 使用图结构信息指导图像特征
-            try:
-                attended_image, _ = self.cross_attention(
-                    image_features.unsqueeze(1), 
-                    graph_features.unsqueeze(1), 
-                    graph_features.unsqueeze(1)
-                )
-                aligned_features.append(attended_image.squeeze(1))
-            except:
-                aligned_features.append(image_features)
-        
-        if graph_features is not None:
-            aligned_features.append(graph_features)
-        
-        if len(aligned_features) == 0:
-            return None
-        elif len(aligned_features) == 1:
-            return aligned_features[0]
-        else:
-            # 简单平均融合
-            return torch.stack(aligned_features).mean(dim=0)
-
-
-class RelationAwareGNN(nn.Module):
-    """关系感知的图神经网络"""
-    
-    def __init__(self, input_dim, hidden_dim, num_relations=10, dropout=0.1):
-        super(RelationAwareGNN, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_relations = num_relations
-        
-        # 关系变换层
-        self.relation_transform = nn.Linear(input_dim, hidden_dim)
-        
-        # 注意力机制
-        self.attention = nn.MultiheadAttention(hidden_dim, num_heads=4, dropout=dropout)
-        
-        # 输出投影
-        self.output_projection = nn.Linear(hidden_dim, input_dim)
-        self.norm = nn.LayerNorm(input_dim)
-        
-    def forward(self, node_features, adj_matrix, relation_types=None):
-        """
-        Args:
-            node_features: [N, input_dim] 节点特征
-            adj_matrix: 邻接矩阵
-            relation_types: 关系类型（可选）
-        """
-        # 关系感知变换
-        transformed = self.relation_transform(node_features)
-        
-        # 简单的图卷积操作
-        if adj_matrix is not None and adj_matrix.is_sparse:
-            aggregated = torch.sparse.mm(adj_matrix, transformed)
-        else:
-            aggregated = transformed
-        
-        # 输出投影和残差连接
-        output = self.output_projection(aggregated)
-        output = self.norm(output + node_features)
-        
-        return output
-
-
 class KnowledgeAwareFusion(nn.Module):
-    """知识感知的特征融合层"""
+    """修正的知识感知特征融合层"""
     
     def __init__(self, modal_dims, output_dim, fusion_strategy="weighted_concat"):
         super(KnowledgeAwareFusion, self).__init__()
@@ -344,28 +199,29 @@ class KnowledgeAwareFusion(nn.Module):
         self.modal_dims = modal_dims
         self.output_dim = output_dim
         
+        # 计算标准化维度 - 确保所有模态特征都投影到相同维度
+        self.standard_dim = 128  # 标准化维度
+        
+        # 为每个模态创建投影层
+        self.modal_projections = nn.ModuleDict()
+        for modal_name, modal_dim in modal_dims.items():
+            self.modal_projections[modal_name] = nn.Linear(modal_dim, self.standard_dim)
+        
         if fusion_strategy == "weighted_concat":
             # 为每个模态学习权重
             self.modal_weights = nn.Parameter(torch.ones(len(modal_dims)))
-            total_dim = sum(modal_dims.values())
-            self.projection = nn.Linear(total_dim, output_dim)
-            
-        elif fusion_strategy == "adaptive":
-            # 自适应融合
-            num_modals = len(modal_dims)
-            self.modal_weights = nn.Parameter(torch.ones(num_modals))
-            total_dim = sum(modal_dims.values())
+            total_dim = len(modal_dims) * self.standard_dim
             self.projection = nn.Linear(total_dim, output_dim)
             
         elif fusion_strategy == "attention":
             # 注意力融合
-            total_dim = sum(modal_dims.values())
+            total_dim = len(modal_dims) * self.standard_dim
             self.attention = nn.Linear(total_dim, len(modal_dims))
             self.projection = nn.Linear(total_dim, output_dim)
             
         elif fusion_strategy == "simple_concat":
             # 简单拼接
-            total_dim = sum(modal_dims.values())
+            total_dim = len(modal_dims) * self.standard_dim
             self.projection = nn.Linear(total_dim, output_dim)
     
     def forward(self, modal_features, knowledge_context=None):
@@ -377,18 +233,29 @@ class KnowledgeAwareFusion(nn.Module):
         valid_features = []
         feature_names = []
         
-        for name, dim in self.modal_dims.items():
+        # 投影所有特征到标准维度
+        for name in self.modal_dims.keys():
             if name in modal_features and modal_features[name] is not None:
-                valid_features.append(modal_features[name])
-                feature_names.append(name)
+                # 投影到标准维度
+                try:
+                    projected_feat = self.modal_projections[name](modal_features[name])
+                    valid_features.append(projected_feat)
+                    feature_names.append(name)
+                except Exception as e:
+                    print(f"Warning: Failed to project {name} features: {e}")
+                    continue
         
         if not valid_features:
             # 如果没有有效特征，返回零特征
-            batch_size = 1
+            batch_size = knowledge_context.size(0) if knowledge_context is not None else 1
             device = next(self.parameters()).device
             return torch.zeros(batch_size, self.output_dim, device=device)
         
-        if self.fusion_strategy == "weighted_concat" or self.fusion_strategy == "adaptive":
+        # 确保所有特征有相同的batch size
+        min_batch_size = min(f.size(0) for f in valid_features)
+        valid_features = [f[:min_batch_size] for f in valid_features]
+        
+        if self.fusion_strategy == "weighted_concat":
             # 加权拼接
             weights = torch.softmax(self.modal_weights[:len(valid_features)], dim=0)
             weighted_features = [w * f for w, f in zip(weights, valid_features)]
@@ -414,7 +281,7 @@ class KnowledgeAwareFusion(nn.Module):
 
 
 class IBMultiModal(nn.Module):
-    """修正后的多模态实体对齐模型"""
+    """修正的多模态实体对齐模型"""
     
     def __init__(
         self,
@@ -454,24 +321,29 @@ class IBMultiModal(nn.Module):
         self.name_fc = nn.Linear(300, char_dim)
         self.char_fc = nn.Linear(char_feature_dim, char_dim)
 
-        # 增强的CLIP编码器
+        # CLIP相关组件
         self.use_clip = getattr(args, 'use_clip', False)
+        self.clip_encoder = None
+        self.clip_dim = 0
+        
         if self.use_clip and CLIP_AVAILABLE:
             try:
-                self.clip_encoder = EnhancedCLIPEncoder(
+                self.clip_encoder = CLIPEntityEncoder(
                     clip_model_name=getattr(args, 'clip_model_name', 'openai/clip-vit-base-patch32'),
                     freeze_clip=getattr(args, 'clip_freeze', True),
-                    device=getattr(args, 'device', None),
-                    text_projection_dim=img_dim,
-                    image_projection_dim=img_dim
+                    device=getattr(args, 'device', None)
                 )
-                print(f"Enhanced CLIP encoder initialized")
+                self.clip_dim = self.clip_encoder.clip_dim
+                
+                # CLIP特征投影层
+                self.clip_projection = nn.Linear(self.clip_dim, img_dim)
+                
+                print(f"CLIP encoder initialized with dimension {self.clip_dim}")
             except Exception as e:
                 print(f"Warning: Failed to initialize CLIP encoder: {e}")
                 self.use_clip = False
                 self.clip_encoder = None
-        else:
-            self.clip_encoder = None
+                self.clip_dim = 0
 
         # 变分信息瓶颈相关
         self.use_graph_vib = getattr(args, 'use_graph_vib', False)
@@ -491,19 +363,55 @@ class IBMultiModal(nn.Module):
             self.att_fc_mu = nn.Linear(attr_dim, attr_dim)
             self.att_fc_std = nn.Linear(attr_dim, attr_dim)
 
-        # 图结构编码器
+        # 图结构编码器 - 修正VIB初始化
         no_diag = getattr(args, 'no_diag', False)
         diag = not no_diag
         
-        if self.args.structure_encoder == "gnn_enhanced":
-            self.cross_graph_model = RelationAwareGNN(
-                input_dim=self.input_dim,
-                hidden_dim=self.n_units[-1],
-                num_relations=getattr(args, 'num_relations', 10),
-                dropout=dropout
-            )
-            print("Using enhanced relation-aware GNN")
-        elif self.args.structure_encoder == "gcn":
+        # 初始化图结构编码器
+        self._init_structure_encoder(dropout, diag)
+
+        # 多模态融合 - 修正维度配置
+        modal_dims = {}
+        if args.w_gcn: modal_dims['graph'] = self.n_units[-1]
+        if args.w_img: modal_dims['image'] = img_dim
+        if args.w_rel: modal_dims['relation'] = attr_dim  
+        if args.w_attr: modal_dims['attribute'] = attr_dim
+        if args.w_name: modal_dims['name'] = char_dim
+        if args.w_char: modal_dims['char'] = char_dim
+        if self.use_clip: modal_dims['clip'] = img_dim  # CLIP特征投影后的维度
+        
+        # 知识感知融合层
+        joint_dim = getattr(args, 'joint_dim', 600)
+        self.fusion = KnowledgeAwareFusion(
+            modal_dims=modal_dims,
+            output_dim=joint_dim,
+            fusion_strategy=getattr(args, 'fusion_strategy', 'weighted_concat')
+        )
+
+        # 投影头
+        if self.use_project_head:
+            self.img_pro = ProjectionHead(img_dim, img_dim, img_dim, dropout)
+            self.att_pro = ProjectionHead(attr_dim, attr_dim, attr_dim, dropout)
+            self.rel_pro = ProjectionHead(attr_dim, attr_dim, attr_dim, dropout)
+            self.gph_pro = ProjectionHead(self.n_units[-1], self.n_units[-1], self.n_units[-1], dropout)
+
+        # 联合变分编码
+        if self.use_joint_vib:
+            self.joint_fc = nn.Linear(joint_dim, joint_dim)
+            self.joint_fc_mu = nn.Linear(joint_dim, joint_dim)
+            self.joint_fc_std = nn.Linear(joint_dim, joint_dim)
+
+        # 初始化损失
+        self.kld_loss = 0
+        self.img_kld_loss = 0
+        self.rel_kld_loss = 0
+        self.attr_kld_loss = 0
+        self.joint_kld_loss = 0
+        self.clip_features = {}  # 存储CLIP特征用于损失计算
+
+    def _init_structure_encoder(self, dropout, diag):
+        """初始化图结构编码器"""
+        if self.args.structure_encoder == "gcn":
             if self.use_graph_vib:
                 self.cross_graph_model_mu = SimpleGCN(
                     self.n_units[0], 
@@ -551,52 +459,11 @@ class IBMultiModal(nn.Module):
                     instance_normalization=self.args.instance_normalization,
                     diag=True,
                 )
-
-        # 知识感知对齐模块
-        self.knowledge_alignment = KnowledgeAwareAlignment(
-            feature_dim=self.n_units[-1],
-            num_heads=8,
-            dropout=dropout
-        )
-
-        # 多模态融合
-        modal_dims = {}
-        if args.w_gcn: modal_dims['graph'] = self.n_units[-1]
-        if args.w_img: modal_dims['image'] = img_dim
-        if args.w_rel: modal_dims['relation'] = attr_dim  
-        if args.w_attr: modal_dims['attribute'] = attr_dim
-        if args.w_name: modal_dims['name'] = char_dim
-        if args.w_char: modal_dims['char'] = char_dim
-        if self.use_clip: modal_dims['clip'] = img_dim
-        
-        # 知识感知融合层
-        joint_dim = getattr(args, 'joint_dim', 600)
-        self.fusion = KnowledgeAwareFusion(
-            modal_dims=modal_dims,
-            output_dim=joint_dim,
-            fusion_strategy=getattr(args, 'fusion_strategy', 'simple_concat')
-        )
-
-        # 投影头
-        if self.use_project_head:
-            self.img_pro = ProjectionHead(img_dim, img_dim, img_dim, dropout)
-            self.att_pro = ProjectionHead(attr_dim, attr_dim, attr_dim, dropout)
-            self.rel_pro = ProjectionHead(attr_dim, attr_dim, attr_dim, dropout)
-            self.gph_pro = ProjectionHead(self.n_units[-1], self.n_units[-1], self.n_units[-1], dropout)
-
-        # 联合变分编码
-        if self.use_joint_vib:
-            self.joint_fc = nn.Linear(joint_dim, joint_dim)
-            self.joint_fc_mu = nn.Linear(joint_dim, joint_dim)
-            self.joint_fc_std = nn.Linear(joint_dim, joint_dim)
-
-        # 初始化损失
-        self.kld_loss = 0
-        self.img_kld_loss = 0
-        self.rel_kld_loss = 0
-        self.attr_kld_loss = 0
-        self.joint_kld_loss = 0
-        self.clip_features = {}
+        else:
+            # 默认使用GAT
+            print(f"Warning: Unknown structure encoder '{self.args.structure_encoder}', using GAT")
+            self.args.structure_encoder = "gat"
+            self._init_structure_encoder(dropout, diag)
 
     def _kld_gauss(self, mu_1, logsigma_1, mu_2, logsigma_2):
         """KL散度计算"""
@@ -637,7 +504,7 @@ class IBMultiModal(nn.Module):
         entity_texts=None,
     ):
         modal_features = {}
-        self.clip_features = {}
+        self.clip_features = {}  # 重置CLIP特征存储
         
         # === 图结构特征处理 ===
         gph_emb = None
@@ -645,20 +512,32 @@ class IBMultiModal(nn.Module):
             try:
                 entity_input = self.entity_emb(input_idx)
                 if self.use_graph_vib:
-                    gph_emb_mu = self.cross_graph_model_mu(entity_input, adj)
-                    gph_emb_std = self.cross_graph_model_std(entity_input, adj)
-                    eps = torch.randn_like(gph_emb_std)
-                    gph_emb = gph_emb_mu + eps * gph_emb_std
-                    self.kld_loss = self._kld_gauss(
-                        gph_emb_mu, gph_emb_std, 
-                        torch.zeros_like(gph_emb_mu), torch.ones_like(gph_emb_std)
-                    )
+                    # 修正：检查属性是否存在
+                    if hasattr(self, 'cross_graph_model_mu') and hasattr(self, 'cross_graph_model_std'):
+                        gph_emb_mu = self.cross_graph_model_mu(entity_input, adj)
+                        gph_emb_std = self.cross_graph_model_std(entity_input, adj)
+                        eps = torch.randn_like(gph_emb_std)
+                        gph_emb = gph_emb_mu + eps * gph_emb_std
+                        self.kld_loss = self._kld_gauss(
+                            gph_emb_mu, gph_emb_std, 
+                            torch.zeros_like(gph_emb_mu), torch.ones_like(gph_emb_std)
+                        )
+                    else:
+                        print("Warning: VIB graph models not initialized, using standard model")
+                        if hasattr(self, 'cross_graph_model'):
+                            gph_emb = self.cross_graph_model(entity_input, adj)
+                        else:
+                            gph_emb = entity_input
                 else:
-                    gph_emb = self.cross_graph_model(entity_input, adj)
+                    if hasattr(self, 'cross_graph_model'):
+                        gph_emb = self.cross_graph_model(entity_input, adj)
+                    else:
+                        gph_emb = entity_input
                 modal_features['graph'] = gph_emb
             except Exception as e:
                 print(f"Warning: Graph encoding failed: {e}")
-                gph_emb = self.entity_emb(input_idx)
+                entity_input = self.entity_emb(input_idx)
+                gph_emb = entity_input
                 modal_features['graph'] = gph_emb
 
         # === 图像特征处理 ===
@@ -667,7 +546,7 @@ class IBMultiModal(nn.Module):
             try:
                 img_emb = self.img_fc(img_features)
                 
-                if self.use_img_vib:
+                if self.use_img_vib and hasattr(self, 'img_fc_mu'):
                     img_emb_h = F.relu(img_emb)
                     mu = self.img_fc_mu(img_emb_h)
                     logvar = self.img_fc_std(img_emb_h)
@@ -686,7 +565,7 @@ class IBMultiModal(nn.Module):
         rel_emb = None
         if self.args.w_rel and rel_features is not None:
             try:
-                if self.use_rel_vib:
+                if self.use_rel_vib and hasattr(self, 'rel_fc_mu'):
                     rel_emb = self.rel_fc(rel_features)
                     rel_emb_h = F.relu(rel_emb)
                     mu = self.rel_fc_mu(rel_emb_h)
@@ -707,7 +586,7 @@ class IBMultiModal(nn.Module):
         att_emb = None
         if self.args.w_attr and att_features is not None:
             try:
-                if self.use_attr_vib:
+                if self.use_attr_vib and hasattr(self, 'att_fc_mu'):
                     att_emb = self.att_fc(att_features)
                     att_emb_h = F.relu(att_emb)
                     mu = self.att_fc_mu(att_emb_h)
@@ -744,50 +623,49 @@ class IBMultiModal(nn.Module):
         # === CLIP特征处理 ===
         if self.use_clip and self.clip_encoder is not None:
             try:
-                clip_results = self.clip_encoder(
-                    image_features=img_features,
-                    texts=entity_texts
-                )
+                clip_results = {}
                 
-                # 保存CLIP特征用于损失计算
-                self.clip_features.update(clip_results)
+                # 编码图像特征
+                if img_features is not None:
+                    clip_results['image_embeds'] = self.clip_encoder.encode_images(img_features)
+                    self.clip_features['image_embeds'] = clip_results['image_embeds']
+                
+                # 编码文本特征
+                if entity_texts is not None:
+                    clip_results['text_embeds'] = self.clip_encoder.encode_texts(entity_texts)
+                    self.clip_features['text_embeds'] = clip_results['text_embeds']
                 
                 # 融合CLIP特征
-                if 'text_embeds' in clip_results and 'image_embeds' in clip_results:
-                    # 简单平均
-                    clip_fused = (clip_results['text_embeds'] + clip_results['image_embeds']) / 2
-                    modal_features['clip'] = clip_fused
-                elif 'text_embeds' in clip_results:
-                    modal_features['clip'] = clip_results['text_embeds']
+                if 'image_embeds' in clip_results and 'text_embeds' in clip_results:
+                    # 使用注意力机制融合图像和文本特征
+                    img_clip = clip_results['image_embeds']
+                    text_clip = clip_results['text_embeds']
+                    
+                    # 简单的加权平均（可以改进为注意力机制）
+                    clip_fused = (img_clip + text_clip) / 2
+                    clip_projected = self.clip_projection(clip_fused)
+                    modal_features['clip'] = clip_projected
+                    
                 elif 'image_embeds' in clip_results:
-                    modal_features['clip'] = clip_results['image_embeds']
+                    clip_projected = self.clip_projection(clip_results['image_embeds'])
+                    modal_features['clip'] = clip_projected
+                    
+                elif 'text_embeds' in clip_results:
+                    clip_projected = self.clip_projection(clip_results['text_embeds'])
+                    modal_features['clip'] = clip_projected
                     
             except Exception as e:
                 print(f"Warning: CLIP encoding failed: {e}")
 
-        # === 知识感知对齐 ===
-        if len(modal_features) > 1:
-            try:
-                # 提取主要模态进行知识感知对齐
-                text_feat = modal_features.get('clip') or modal_features.get('name')
-                image_feat = modal_features.get('image')
-                graph_feat = modal_features.get('graph')
-                
-                aligned_features = self.knowledge_alignment(text_feat, image_feat, graph_feat)
-                if aligned_features is not None:
-                    modal_features['aligned'] = aligned_features
-            except Exception as e:
-                print(f"Warning: Knowledge alignment failed: {e}")
-
         # === 投影头处理 ===
         if self.use_project_head:
-            if 'image' in modal_features:
+            if 'image' in modal_features and modal_features['image'] is not None:
                 modal_features['image'] = self.img_pro(modal_features['image'])
-            if 'attribute' in modal_features:
+            if 'attribute' in modal_features and modal_features['attribute'] is not None:
                 modal_features['attribute'] = self.att_pro(modal_features['attribute'])
-            if 'relation' in modal_features:
+            if 'relation' in modal_features and modal_features['relation'] is not None:
                 modal_features['relation'] = self.rel_pro(modal_features['relation'])
-            if 'graph' in modal_features:
+            if 'graph' in modal_features and modal_features['graph'] is not None:
                 modal_features['graph'] = self.gph_pro(modal_features['graph'])
 
         # === 多模态融合 ===
@@ -796,23 +674,10 @@ class IBMultiModal(nn.Module):
             joint_emb = self.fusion(modal_features, knowledge_context)
         except Exception as e:
             print(f"Warning: Fusion failed: {e}")
-            # Fallback融合
-            valid_embeddings = [emb for emb in modal_features.values() if emb is not None]
-            if valid_embeddings:
-                # 简单拼接
-                joint_emb = torch.cat(valid_embeddings, dim=-1)
-                # 投影到目标维度
-                if not hasattr(self, 'fallback_projection'):
-                    input_dim = joint_emb.size(-1)
-                    output_dim = getattr(self.args, 'joint_dim', 600)
-                    self.fallback_projection = nn.Linear(input_dim, output_dim).to(joint_emb.device)
-                joint_emb = self.fallback_projection(joint_emb)
-            else:
-                joint_emb = torch.zeros(input_idx.size(0), getattr(self.args, 'joint_dim', 600), 
-                                      device=input_idx.device)
+            joint_emb = self._fallback_fusion(modal_features, input_idx)
 
         # === 联合变分编码 ===
-        if self.use_joint_vib:
+        if self.use_joint_vib and hasattr(self, 'joint_fc_mu'):
             try:
                 joint_emb = self.joint_fc(joint_emb)
                 joint_emb_h = F.relu(joint_emb)
@@ -829,8 +694,41 @@ class IBMultiModal(nn.Module):
 
         return gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}(ENT_NUM={self.ENT_NUM}, use_clip={self.use_clip})"
+    def _fallback_fusion(self, modal_features, input_idx):
+        """备用融合方法"""
+        valid_embeddings = [emb for emb in modal_features.values() if emb is not None]
+        
+        if valid_embeddings:
+            # 投影所有特征到相同维度然后拼接
+            standard_dim = 128
+            projected_embeddings = []
+            
+            for i, emb in enumerate(valid_embeddings):
+                proj_attr_name = f'fallback_projection_{i}'
+                if not hasattr(self, proj_attr_name):
+                    setattr(self, proj_attr_name, 
+                           nn.Linear(emb.size(-1), standard_dim).to(emb.device))
+                proj_layer = getattr(self, proj_attr_name)
+                projected_embeddings.append(proj_layer(emb))
+            
+            # 拼接投影后的特征
+            joint_emb = torch.cat(projected_embeddings, dim=-1)
+            
+            # 最终投影到目标维度
+            if not hasattr(self, 'final_fallback_projection'):
+                input_dim = joint_emb.size(-1)
+                output_dim = getattr(self.args, 'joint_dim', 600)
+                self.final_fallback_projection = nn.Linear(input_dim, output_dim).to(joint_emb.device)
+            joint_emb = self.final_fallback_projection(joint_emb)
+        else:
+            # 如果没有任何有效特征，使用实体嵌入
+            entity_input = self.entity_emb(input_idx)
+            output_dim = getattr(self.args, 'joint_dim', 600)
+            if not hasattr(self, 'emergency_projection'):
+                self.emergency_projection = nn.Linear(entity_input.size(-1), output_dim).to(entity_input.device)
+            joint_emb = self.emergency_projection(entity_input)
+        
+        return joint_emb
 
 
 # 为了保持兼容性，设置别名
