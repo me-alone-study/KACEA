@@ -107,8 +107,7 @@ def load_img_features_dropout(
     return img_features
 
 
-class IBMEA:
-    """修正的IBMEA训练类"""
+class KACEA:
 
     def __init__(self):
         # 数据相关属性
@@ -1353,5 +1352,5 @@ Entity names:\t{self.args.use_entity_names}
 
 
 if __name__ == "__main__":
-    model = IBMEA()
+    model = KACEA()
     model.train()

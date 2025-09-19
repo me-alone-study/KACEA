@@ -734,3 +734,4 @@ class IBMultiModal(nn.Module):
 # 为了保持兼容性，设置别名
 KAMultiModal = IBMultiModal
 ClipEnhancedKACEA = IBMultiModal
+KACEA = IBMultiModal
