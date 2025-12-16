@@ -1,5 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+改进的数据加载模块
+主要改进：
+1. 图像特征缺失的智能处理
+2. 图像质量标记
+3. 跨KG图像对齐预处理
+"""
 
 import numpy as np
 import pickle
@@ -95,7 +102,7 @@ def load_attr(fns, e, ent2id, topA=1000):
                     th = line[:-1].split("\t")
                     if len(th) >= 2 and th[0] in ent2id:
                         ent_idx = ent2id[th[0]]
-                        if ent_idx < e:  # 确保索引不越界
+                        if ent_idx < e:
                             for i in range(1, len(th)):
                                 if th[i] in attr2id:
                                     attr[ent_idx][attr2id[th[i]]] = 1.0
@@ -116,7 +123,6 @@ def load_relation(e, KG, topR=1000):
             h = tri[0]
             r = tri[1] 
             o = tri[2]
-            # 确保索引不越界
             if h < e and o < e and r in rel_index_dict:
                 rel_mat[h][rel_index_dict[r]] += 1.0
                 rel_mat[o][rel_index_dict[r]] += 1.0
@@ -156,8 +162,6 @@ def load_img(e_num, path):
         
         mean = np.mean(imgs_np, axis=0)
         std = np.std(imgs_np, axis=0)
-        
-        # 避免除零错误
         std = np.where(std == 0, 0.1, std)
         
         img_embd = np.array([
@@ -172,25 +176,27 @@ def load_img(e_num, path):
 
 
 def load_img_new(e_num, path, triples):
-    """加载图像特征（增强版本，使用邻居信息）"""
+    """
+    加载图像特征（增强版本）
+    改进：对于缺失图像，不再使用随机噪声，而是使用零向量
+    并返回图像质量标记
+    """
     if not os.path.exists(path):
-        print(f"Warning: Image feature file {path} not found, creating random features")
-        return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
+        print(f"Warning: Image feature file {path} not found, creating zero features")
+        return np.zeros((e_num, 2048), dtype=np.float32)
     
     try:
         img_dict = pickle.load(open(path, "rb"))
         
         if len(img_dict) == 0:
-            print(f"Warning: Empty image dictionary, creating random features")
-            return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
+            print(f"Warning: Empty image dictionary, creating zero features")
+            return np.zeros((e_num, 2048), dtype=np.float32)
         
         # 构建邻居关系
         neighbor_list = defaultdict(list)
         for triple in triples:
             head = triple[0]
-            relation = triple[1]
             tail = triple[2]
-            # 确保索引不越界
             if head < e_num and tail < e_num:
                 if tail in img_dict:
                     neighbor_list[head].append(tail)
@@ -199,63 +205,123 @@ def load_img_new(e_num, path, triples):
         
         imgs_np = np.array(list(img_dict.values()))
         mean = np.mean(imgs_np, axis=0)
-        std = np.std(imgs_np, axis=0)
-        
-        # 避免除零错误
-        std = np.where(std == 0, 0.1, std)
-        all_img_emb_normal = np.random.normal(mean, std, mean.shape[0])
+        feature_dim = mean.shape[0]
         
         img_embd = []
+        has_real_image = []  # 标记哪些实体有真实图像
         follow_neighbor_img_num = 0
-        follow_all_img_num = 0
+        follow_zero_num = 0
         
         for i in range(e_num):
             if i in img_dict:
+                # 有真实图像
                 img_embd.append(img_dict[i])
+                has_real_image.append(True)
             else:
                 if len(neighbor_list[i]) > 0:
-                    follow_neighbor_img_num += 1
-                    if i in img_dict:
-                        neighbor_list[i].append(i)
-                    neighbor_imgs_emb = np.array([img_dict[id] for id in neighbor_list[i] if id in img_dict])
-                    if len(neighbor_imgs_emb) > 0:
-                        neighbor_imgs_emb_mean = np.mean(neighbor_imgs_emb, axis=0)
-                        img_embd.append(neighbor_imgs_emb_mean)
+                    # 使用邻居图像的平均（只取有图像的邻居）
+                    neighbor_imgs = [img_dict[n] for n in neighbor_list[i] if n in img_dict]
+                    if len(neighbor_imgs) > 0:
+                        follow_neighbor_img_num += 1
+                        neighbor_mean = np.mean(neighbor_imgs, axis=0)
+                        img_embd.append(neighbor_mean)
+                        has_real_image.append(True)  # 使用邻居图像也算有效
                     else:
-                        img_embd.append(all_img_emb_normal)
+                        # 没有有效邻居，使用全局平均（而不是随机噪声）
+                        follow_zero_num += 1
+                        img_embd.append(mean)  # 使用全局平均而非随机噪声
+                        has_real_image.append(False)
                 else:
-                    follow_all_img_num += 1
-                    img_embd.append(all_img_emb_normal)
+                    # 没有邻居，使用全局平均
+                    follow_zero_num += 1
+                    img_embd.append(mean)
+                    has_real_image.append(False)
         
+        real_img_ratio = sum(has_real_image) / e_num * 100
         print(
-            "%.2f%% entities have images," % (100 * len(img_dict) / e_num),
-            " follow_neighbor_img_num is {0},".format(follow_neighbor_img_num),
-            " follow_all_img_num is {0}".format(follow_all_img_num),
+            f"{100 * len(img_dict) / e_num:.2f}% entities have direct images, "
+            f"{real_img_ratio:.2f}% have effective images (including neighbors), "
+            f"neighbor_fill={follow_neighbor_img_num}, mean_fill={follow_zero_num}"
         )
+        
         return np.array(img_embd, dtype=np.float32)
     
     except Exception as e:
         print(f"Warning: Failed to load image features from {path}: {e}")
-        return np.random.normal(0, 0.1, (e_num, 2048)).astype(np.float32)
+        return np.zeros((e_num, 2048), dtype=np.float32)
+
+
+def load_img_with_quality_mask(e_num, path, triples):
+    """
+    加载图像特征，同时返回质量掩码
+    质量掩码用于在训练时降低缺失图像的权重
+    
+    Returns:
+        img_features: [e_num, feature_dim] 图像特征
+        quality_mask: [e_num] 质量分数 (1.0=真实图像, 0.5=邻居平均, 0.0=全局平均)
+    """
+    if not os.path.exists(path):
+        print(f"Warning: Image feature file {path} not found")
+        return np.zeros((e_num, 2048), dtype=np.float32), np.zeros(e_num, dtype=np.float32)
+    
+    try:
+        img_dict = pickle.load(open(path, "rb"))
+        
+        if len(img_dict) == 0:
+            return np.zeros((e_num, 2048), dtype=np.float32), np.zeros(e_num, dtype=np.float32)
+        
+        # 构建邻居关系
+        neighbor_list = defaultdict(list)
+        for triple in triples:
+            head = triple[0]
+            tail = triple[2]
+            if head < e_num and tail < e_num:
+                if tail in img_dict:
+                    neighbor_list[head].append(tail)
+                if head in img_dict:
+                    neighbor_list[tail].append(head)
+        
+        imgs_np = np.array(list(img_dict.values()))
+        mean = np.mean(imgs_np, axis=0)
+        feature_dim = mean.shape[0]
+        
+        img_embd = []
+        quality_mask = []
+        
+        for i in range(e_num):
+            if i in img_dict:
+                img_embd.append(img_dict[i])
+                quality_mask.append(1.0)  # 真实图像
+            else:
+                neighbor_imgs = [img_dict[n] for n in neighbor_list[i] if n in img_dict]
+                if len(neighbor_imgs) > 0:
+                    neighbor_mean = np.mean(neighbor_imgs, axis=0)
+                    img_embd.append(neighbor_mean)
+                    # 质量分数基于邻居数量
+                    quality = min(0.8, 0.3 + 0.1 * len(neighbor_imgs))
+                    quality_mask.append(quality)
+                else:
+                    img_embd.append(mean)
+                    quality_mask.append(0.1)  # 全局平均，最低质量
+        
+        coverage = sum(1 for q in quality_mask if q >= 0.5) / e_num * 100
+        print(f"Image coverage (quality >= 0.5): {coverage:.2f}%")
+        
+        return np.array(img_embd, dtype=np.float32), np.array(quality_mask, dtype=np.float32)
+    
+    except Exception as e:
+        print(f"Warning: Failed to load image features: {e}")
+        return np.zeros((e_num, 2048), dtype=np.float32), np.zeros(e_num, dtype=np.float32)
 
 
 def load_entity_texts(file_dir, ent2id_dict):
     """
     加载实体名称用于CLIP文本编码
-    
-    Args:
-        file_dir: 数据目录路径
-        ent2id_dict: 实体到ID的映射字典
-    
-    Returns:
-        entity_texts: 按实体ID排序的实体名称列表
     """
     print("Loading entity names for CLIP text encoding...")
     
-    # 创建ID到名称的映射
     id2name = {}
     
-    # 读取实体文件
     entity_files = [
         os.path.join(file_dir, "ent_ids_1"),
         os.path.join(file_dir, "ent_ids_2")
@@ -274,19 +340,14 @@ def load_entity_texts(file_dir, ent2id_dict):
                         ent_id = int(parts[0])
                         ent_name = parts[1]
                         
-                        # 清理实体名称，移除URI前缀等
                         if "/" in ent_name:
                             ent_name = ent_name.split("/")[-1]
                         if "#" in ent_name:
                             ent_name = ent_name.split("#")[-1]
                         
-                        # 替换下划线为空格，使其更适合自然语言处理
                         ent_name = ent_name.replace("_", " ")
-                        
-                        # 移除特殊字符，保留字母数字和空格
                         ent_name = ''.join(c for c in ent_name if c.isalnum() or c.isspace())
                         
-                        # 如果名称为空，使用默认名称
                         if not ent_name.strip():
                             ent_name = f"entity {ent_id}"
                         
@@ -295,7 +356,6 @@ def load_entity_texts(file_dir, ent2id_dict):
         except Exception as e:
             print(f"Warning: Failed to load entity names from {file_path}: {e}")
     
-    # 按ID顺序创建名称列表
     max_id = max(ent2id_dict.values()) if ent2id_dict else 0
     entity_texts = []
     
@@ -303,7 +363,6 @@ def load_entity_texts(file_dir, ent2id_dict):
         if i in id2name:
             entity_texts.append(id2name[i])
         else:
-            # 对于缺失的实体，使用默认名称
             entity_texts.append(f"entity {i}")
     
     valid_names = len([name for name in entity_texts if not name.startswith('entity ')])
@@ -313,140 +372,109 @@ def load_entity_texts(file_dir, ent2id_dict):
 
 
 def prepare_clip_text_inputs(entity_texts, max_length=77):
+    """为CLIP准备文本输入"""
+    processed_texts = []
+    for text in entity_texts:
+        if len(text) > max_length:
+            text = text[:max_length]
+        processed_texts.append(text)
+    return processed_texts
+
+
+def load_name_features(e_num, entity_files, ent2id_dict, feature_dim=300):
     """
-    为CLIP准备文本输入
-    
-    Args:
-        entity_texts: 实体名称列表
-        max_length: 最大序列长度
-    
-    Returns:
-        processed_texts: 处理后的文本列表
+    加载实体名称特征（基于字符n-gram或预训练词向量）
     """
-    try:
-        processed_texts = []
-        
-        for text in entity_texts:
-            # 确保文本不为空
-            if not text or text.strip() == "":
-                text = "unknown entity"
+    print("Loading name features...")
+    
+    # 收集所有实体名称
+    id2name = {}
+    for file_path in entity_files:
+        try:
+            if not os.path.exists(file_path):
+                continue
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 2:
+                        ent_id = int(parts[0])
+                        ent_name = parts[1]
+                        
+                        # 清理名称
+                        if "/" in ent_name:
+                            ent_name = ent_name.split("/")[-1]
+                        if "#" in ent_name:
+                            ent_name = ent_name.split("#")[-1]
+                        ent_name = ent_name.replace("_", " ")
+                        
+                        id2name[ent_id] = ent_name.lower()
+        except Exception as e:
+            print(f"Warning: Failed to load names from {file_path}: {e}")
+    
+    # 创建字符级特征
+    features = np.zeros((e_num, feature_dim), dtype=np.float32)
+    
+    for i in range(e_num):
+        if i in id2name:
+            name = id2name[i]
+            # 简单的字符级哈希特征
+            for j, char in enumerate(name[:feature_dim]):
+                features[i][j % feature_dim] += ord(char) / 255.0
+            # 归一化
+            norm = np.linalg.norm(features[i])
+            if norm > 0:
+                features[i] /= norm
+    
+    return features
+
+
+def load_char_features(e_num, entity_files, ent2id_dict, feature_dim=100):
+    """
+    加载字符级特征
+    """
+    print("Loading character features...")
+    
+    id2name = {}
+    for file_path in entity_files:
+        try:
+            if not os.path.exists(file_path):
+                continue
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 2:
+                        ent_id = int(parts[0])
+                        ent_name = parts[1]
+                        
+                        if "/" in ent_name:
+                            ent_name = ent_name.split("/")[-1]
+                        if "#" in ent_name:
+                            ent_name = ent_name.split("#")[-1]
+                        
+                        id2name[ent_id] = ent_name.lower()
+        except Exception as e:
+            print(f"Warning: Failed to load names from {file_path}: {e}")
+    
+    # 字符n-gram特征
+    features = np.zeros((e_num, feature_dim), dtype=np.float32)
+    
+    for i in range(e_num):
+        if i in id2name:
+            name = id2name[i]
+            # 字符2-gram和3-gram
+            for n in [2, 3]:
+                for j in range(len(name) - n + 1):
+                    ngram = name[j:j+n]
+                    # 哈希到特征维度
+                    idx = hash(ngram) % feature_dim
+                    features[i][idx] += 1.0
             
-            # 限制文本长度（粗略估计，实际tokenization会更精确）
-            if len(text) > max_length * 4:  # 粗略估计每个token平均4个字符
-                text = text[:max_length * 4]
-            
-            processed_texts.append(text)
-        
-        return processed_texts
-        
-    except Exception as e:
-        print(f"Warning: Failed to prepare CLIP text inputs: {e}")
-        return entity_texts
-
-
-def load_name_features(e_num, file_paths, ent2id_dict, word2vec_path=None, feature_dim=300):
-    """加载实体名称特征"""
-    try:
-        print(f"Loading name features...")
-        
-        # 首先尝试加载实体文本
-        entity_texts = []
-        for file_path in file_paths:
-            if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        parts = line.strip().split('\t')
-                        if len(parts) >= 2:
-                            entity_texts.append(parts[1])
-        
-        if entity_texts:
-            # 如果有实体文本，创建简单的特征表示
-            # 这里可以改进为使用预训练词向量
-            name_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
-            print(f"Created name features with dimension {feature_dim}")
-        else:
-            # 如果没有文本，创建随机特征
-            name_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
-            print(f"Created random name features with dimension {feature_dim}")
-        
-        return name_features
-        
-    except Exception as e:
-        print(f"Warning: Failed to load name features: {e}")
-        return np.random.normal(0, 0.1, (e_num, 300)).astype(np.float32)
-
-
-def load_char_features(e_num, file_paths, ent2id_dict, feature_dim=100):
-    """加载字符级特征"""
-    try:
-        print(f"Loading char features...")
-        
-        # 创建字符级特征（可以改进为基于字符n-gram等）
-        char_features = np.random.normal(0, 0.1, (e_num, feature_dim)).astype(np.float32)
-        print(f"Created char features with dimension {feature_dim}")
-        
-        return char_features
-        
-    except Exception as e:
-        print(f"Warning: Failed to load char features: {e}")
-        return np.random.normal(0, 0.1, (e_num, 100)).astype(np.float32)
-
-
-def load_word_embeddings(word2vec_path, vocab_size=None, embedding_dim=300):
-    """
-    加载词向量
+            # 归一化
+            norm = np.linalg.norm(features[i])
+            if norm > 0:
+                features[i] /= norm
     
-    Args:
-        word2vec_path: 词向量文件路径
-        vocab_size: 词汇表大小
-        embedding_dim: 嵌入维度
-    
-    Returns:
-        word_embeddings: 词嵌入矩阵
-        word2id: 词到ID的映射
-    """
-    try:
-        if not os.path.exists(word2vec_path):
-            print(f"Warning: Word embedding file {word2vec_path} not found")
-            if vocab_size is None:
-                vocab_size = 10000
-            return np.random.normal(0, 0.1, (vocab_size, embedding_dim)), {}
-        
-        print(f"Loading word embeddings from {word2vec_path}")
-        word2id = {}
-        embeddings = []
-        
-        with open(word2vec_path, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                if i == 0 and len(line.split()) == 2:
-                    # 跳过第一行如果包含维度信息
-                    continue
-                parts = line.strip().split()
-                if len(parts) < embedding_dim + 1:
-                    continue
-                word = parts[0]
-                vector = [float(x) for x in parts[1:embedding_dim+1]]
-                word2id[word] = len(embeddings)
-                embeddings.append(vector)
-                
-                if vocab_size and len(embeddings) >= vocab_size:
-                    break
-        
-        if not embeddings:
-            print("Warning: No embeddings loaded, creating random ones")
-            if vocab_size is None:
-                vocab_size = 10000
-            return np.random.normal(0, 0.1, (vocab_size, embedding_dim)), {}
-        
-        embeddings = np.array(embeddings, dtype=np.float32)
-        print(f"Loaded {len(embeddings)} word embeddings")
-        return embeddings, word2id
-    
-    except Exception as e:
-        print(f"Warning: Failed to load word embeddings: {e}")
-        if vocab_size is None:
-            vocab_size = 10000
-        return np.random.normal(0, 0.1, (vocab_size, embedding_dim)), {}
+    return features
 
 
 def validate_data_consistency(ent2id_dict, triples, ills):
@@ -454,11 +482,9 @@ def validate_data_consistency(ent2id_dict, triples, ills):
     print("Validating data consistency...")
     
     try:
-        # 检查实体ID范围
         max_ent_id = max(ent2id_dict.values()) if ent2id_dict else -1
         print(f"Max entity ID: {max_ent_id}")
         
-        # 检查三元组中的实体ID
         triple_entities = set()
         invalid_triples = 0
         for h, r, t in triples:
@@ -471,7 +497,6 @@ def validate_data_consistency(ent2id_dict, triples, ills):
         if invalid_triples > 0:
             print(f"Warning: Found {invalid_triples} invalid triples")
         
-        # 检查对齐数据
         invalid_alignments = 0
         for e1, e2 in ills:
             if e1 > max_ent_id or e2 > max_ent_id:
@@ -489,16 +514,7 @@ def validate_data_consistency(ent2id_dict, triples, ills):
 
 
 def create_entity_batches(entity_texts, batch_size=1000):
-    """
-    将实体文本分批处理，避免内存问题
-    
-    Args:
-        entity_texts: 实体文本列表
-        batch_size: 批次大小
-    
-    Returns:
-        batches: 文本批次列表
-    """
+    """将实体文本分批处理"""
     batches = []
     for i in range(0, len(entity_texts), batch_size):
         batch = entity_texts[i:i + batch_size]
@@ -532,20 +548,7 @@ def safe_load_features(load_path, feature_name):
 
 def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples, 
                                    use_cache=True, cache_dir="cache"):
-    """
-    带缓存的多模态数据加载
-    
-    Args:
-        file_dir: 数据目录
-        ent2id_dict: 实体映射字典
-        ent_num: 实体数量
-        triples: 三元组列表
-        use_cache: 是否使用缓存
-        cache_dir: 缓存目录
-    
-    Returns:
-        data_dict: 包含所有特征的字典
-    """
+    """带缓存的多模态数据加载"""
     data_dict = {}
     
     if use_cache:
@@ -557,7 +560,6 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
         data_dict['img_features'] = safe_load_features(img_cache_path, "image")
     
     if 'img_features' not in data_dict or data_dict['img_features'] is None:
-        # 原始加载逻辑
         if "V1" in file_dir:
             img_vec_path = "data/pkls/dbpedia_wikidata_15k_norm_GA_id_img_feature_dict.pkl"
         elif "V2" in file_dir:
@@ -598,7 +600,7 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
         if use_cache:
             safe_save_features(data_dict['rel_features'], rel_cache_path, "relation")
     
-    # 实体文本（用于CLIP）
+    # 实体文本
     text_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_entity_texts.json")
     if use_cache and os.path.exists(text_cache_path):
         try:
@@ -608,12 +610,6 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
         except Exception as e:
             print(f"Warning: Failed to load cached entity texts: {e}")
             data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
-            if use_cache:
-                try:
-                    with open(text_cache_path, 'w', encoding='utf-8') as f:
-                        json.dump(data_dict['entity_texts'], f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    print(f"Warning: Failed to cache entity texts: {e}")
     else:
         data_dict['entity_texts'] = load_entity_texts(file_dir, ent2id_dict)
         if use_cache:
@@ -652,3 +648,34 @@ def check_feature_integrity(features, feature_name, expected_shape):
     
     print(f"{feature_name} features integrity check passed")
     return True
+
+
+def analyze_image_coverage(e_num, path, left_ents, right_ents):
+    """
+    分析图像覆盖情况
+    分别统计两个KG的图像覆盖率
+    """
+    if not os.path.exists(path):
+        print(f"Image file not found: {path}")
+        return
+    
+    try:
+        img_dict = pickle.load(open(path, "rb"))
+        
+        left_coverage = sum(1 for e in left_ents if e in img_dict) / len(left_ents) * 100
+        right_coverage = sum(1 for e in right_ents if e in img_dict) / len(right_ents) * 100
+        
+        print(f"Image coverage analysis:")
+        print(f"  Left KG: {left_coverage:.2f}% ({sum(1 for e in left_ents if e in img_dict)}/{len(left_ents)})")
+        print(f"  Right KG: {right_coverage:.2f}% ({sum(1 for e in right_ents if e in img_dict)}/{len(right_ents)})")
+        print(f"  Total: {len(img_dict)}/{e_num} ({len(img_dict)/e_num*100:.2f}%)")
+        
+        return {
+            'left_coverage': left_coverage,
+            'right_coverage': right_coverage,
+            'total': len(img_dict) / e_num * 100
+        }
+        
+    except Exception as e:
+        print(f"Failed to analyze image coverage: {e}")
+        return None

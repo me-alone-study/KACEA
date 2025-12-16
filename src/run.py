@@ -519,6 +519,26 @@ class KACEA:
             help="use comprehensive loss function"
         )
         
+        # 多模态融合改进参数
+        parser.add_argument(
+            "--use_cross_modal_attention",
+            action="store_true",
+            default=True,
+            help="use cross-modal attention in fusion"
+        )
+        parser.add_argument(
+            "--hard_negative_weight",
+            type=float,
+            default=0.5,
+            help="weight for hard negative mining loss"
+        )
+        parser.add_argument(
+            "--cross_modal_weight",
+            type=float,
+            default=0.3,
+            help="weight for cross-modal consistency loss"
+        )
+        
         return parser.parse_args()
 
     @staticmethod
@@ -777,13 +797,18 @@ Entity names:\t{self.args.use_entity_names}
         )
         self.criterion_nce = InfoNCE_loss(device=self.device, temperature=self.args.tau)
         
-        # 初始化综合损失函数
+        # 初始化综合损失函数（改进版本）
         if getattr(self.args, 'use_comprehensive_loss', False):
             try:
-                self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
+                from loss import ImprovedComprehensiveLoss
+                self.comprehensive_loss = ImprovedComprehensiveLoss(self.args, self.device)
+                self.log_print("Using ImprovedComprehensiveLoss with hard negative mining and cross-modal consistency")
             except Exception as e:
-                self.log_print(f"Warning: Failed to initialize comprehensive loss: {e}")
-                self.args.use_comprehensive_loss = False
+                self.log_print(f"Warning: Failed to initialize ImprovedComprehensiveLoss: {e}")
+                try:
+                    self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
+                except:
+                    self.args.use_comprehensive_loss = False
         
         # 初始化CLIP损失
         if self.args.use_clip:

@@ -1,5 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+改进的损失函数
+主要改进：
+1. 跨模态一致性损失
+2. 硬负样本挖掘
+3. 模态可靠性加权损失
+4. 对比学习增强
+"""
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +66,235 @@ class InfoNCE_loss(nn.Module):
         return loss
 
 
+class HardNegativeInfoNCE(nn.Module):
+    """
+    带硬负样本挖掘的InfoNCE损失
+    改进点：更关注难以区分的负样本
+    """
+    
+    def __init__(self, device, temperature=0.05, hard_negative_weight=0.5):
+        super().__init__()
+        self.device = device
+        self.temperature = temperature
+        self.hard_negative_weight = hard_negative_weight
+        self.ce_loss = nn.CrossEntropyLoss()
+    
+    def forward(self, emb, train_links):
+        emb = F.normalize(emb)
+        emb_left = emb[train_links[:, 0]]
+        emb_right = emb[train_links[:, 1]]
+        
+        batch_size = emb_left.size(0)
+        
+        # 计算相似度矩阵
+        sim_matrix = torch.mm(emb_left, emb_right.t()) / self.temperature
+        
+        # 标准InfoNCE损失
+        labels = torch.arange(batch_size, device=self.device)
+        loss_l2r = self.ce_loss(sim_matrix, labels)
+        loss_r2l = self.ce_loss(sim_matrix.t(), labels)
+        standard_loss = (loss_l2r + loss_r2l) / 2
+        
+        # 硬负样本损失
+        # 找到每个样本最难的负样本（相似度最高但不是正样本的）
+        with torch.no_grad():
+            # 创建mask，排除对角线（正样本）
+            mask = torch.eye(batch_size, device=self.device).bool()
+            sim_masked = sim_matrix.clone()
+            sim_masked[mask] = -float('inf')
+            
+            # 找到最难的负样本
+            hard_neg_indices = sim_masked.argmax(dim=1)
+        
+        # 计算硬负样本的三元组损失
+        hard_neg_emb = emb_right[hard_neg_indices]
+        pos_sim = (emb_left * emb_right).sum(dim=1)
+        neg_sim = (emb_left * hard_neg_emb).sum(dim=1)
+        
+        # margin-based triplet loss
+        margin = 0.3
+        triplet_loss = F.relu(neg_sim - pos_sim + margin).mean()
+        
+        total_loss = standard_loss + self.hard_negative_weight * triplet_loss
+        
+        return total_loss
+
+
+class CrossModalConsistencyLoss(nn.Module):
+    """
+    跨模态一致性损失
+    强制不同模态表示同一实体时保持一致
+    
+    修复：处理不同模态维度不一致的情况
+    """
+    
+    def __init__(self, device, temperature=0.1, consistency_weight=0.5):
+        super().__init__()
+        self.device = device
+        self.temperature = temperature
+        self.consistency_weight = consistency_weight
+        self.projection_layers = nn.ModuleDict()  # 动态创建投影层
+        self.standard_dim = 128  # 标准化维度
+    
+    def _get_projection(self, dim, name):
+        """获取或创建投影层"""
+        key = f"{name}_{dim}"
+        if key not in self.projection_layers:
+            self.projection_layers[key] = nn.Linear(dim, self.standard_dim).to(self.device)
+        return self.projection_layers[key]
+    
+    def forward(self, modal_features, train_links):
+        """
+        计算跨模态一致性损失
+        
+        Args:
+            modal_features: dict, {modal_name: features [N, D]}
+            train_links: 训练对齐链接 [M, 2]
+        """
+        # 收集有效模态
+        valid_modals = {k: v for k, v in modal_features.items() if v is not None}
+        
+        if len(valid_modals) < 2:
+            return torch.tensor(0.0, device=self.device)
+        
+        total_loss = 0.0
+        pair_count = 0
+        
+        modal_names = list(valid_modals.keys())
+        
+        # 计算每对模态之间的一致性损失
+        for i in range(len(modal_names)):
+            for j in range(i + 1, len(modal_names)):
+                modal_i = modal_names[i]
+                modal_j = modal_names[j]
+                
+                try:
+                    feat_i = valid_modals[modal_i]
+                    feat_j = valid_modals[modal_j]
+                    
+                    # 🔧 修复：投影到相同维度
+                    if feat_i.size(-1) != self.standard_dim:
+                        proj_i = self._get_projection(feat_i.size(-1), modal_i)
+                        feat_i = proj_i(feat_i)
+                    if feat_j.size(-1) != self.standard_dim:
+                        proj_j = self._get_projection(feat_j.size(-1), modal_j)
+                        feat_j = proj_j(feat_j)
+                    
+                    feat_i = F.normalize(feat_i, dim=-1)
+                    feat_j = F.normalize(feat_j, dim=-1)
+                    
+                    # 确保batch size一致
+                    min_size = min(feat_i.size(0), feat_j.size(0))
+                    feat_i = feat_i[:min_size]
+                    feat_j = feat_j[:min_size]
+                    
+                    # 过滤有效的训练链接
+                    valid_links = train_links[train_links[:, 0] < min_size]
+                    valid_links = valid_links[valid_links[:, 1] < min_size]
+                    
+                    if len(valid_links) == 0:
+                        continue
+                    
+                    # 获取对齐实体的特征
+                    aligned_i = feat_i[valid_links[:, 0]]
+                    aligned_j = feat_j[valid_links[:, 1]]
+                    
+                    # 计算对比损失（现在维度一致了）
+                    sim_matrix = torch.mm(aligned_i, aligned_j.t()) / self.temperature
+                    batch_size = sim_matrix.size(0)
+                    labels = torch.arange(batch_size, device=self.device)
+                    
+                    loss_ij = F.cross_entropy(sim_matrix, labels)
+                    loss_ji = F.cross_entropy(sim_matrix.t(), labels)
+                    
+                    total_loss += (loss_ij + loss_ji) / 2
+                    pair_count += 1
+                    
+                except Exception as e:
+                    # 跳过出错的模态对
+                    continue
+        
+        if pair_count > 0:
+            return self.consistency_weight * total_loss / pair_count
+        else:
+            return torch.tensor(0.0, device=self.device)
+
+
+class ModalityReliabilityWeightedLoss(nn.Module):
+    """
+    基于模态可靠性的加权损失
+    对于低质量/缺失模态，降低其在总损失中的权重
+    """
+    
+    def __init__(self, device, base_temperature=0.05):
+        super().__init__()
+        self.device = device
+        self.base_temperature = base_temperature
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+    
+    def compute_reliability_scores(self, features, reference_features=None):
+        """
+        计算每个样本的可靠性分数
+        基于特征方差和与参考特征的一致性
+        """
+        if features is None:
+            return None
+        
+        # 计算特征方差（低方差可能表示随机填充）
+        feature_var = features.var(dim=-1)
+        var_score = torch.sigmoid(feature_var * 10 - 0.5)
+        
+        # 计算特征范数
+        feature_norm = features.norm(dim=-1)
+        norm_score = torch.sigmoid(feature_norm - 0.5)
+        
+        # 如果有参考特征，计算一致性
+        if reference_features is not None:
+            ref_norm = F.normalize(reference_features, dim=-1)
+            feat_norm = F.normalize(features, dim=-1)
+            consistency = (ref_norm * feat_norm).sum(dim=-1)
+            consistency_score = (consistency + 1) / 2  # 归一化到[0, 1]
+            reliability = (var_score + norm_score + consistency_score) / 3
+        else:
+            reliability = (var_score + norm_score) / 2
+        
+        return reliability
+    
+    def forward(self, emb, train_links, reliability_scores=None):
+        """
+        加权InfoNCE损失
+        """
+        emb = F.normalize(emb)
+        emb_left = emb[train_links[:, 0]]
+        emb_right = emb[train_links[:, 1]]
+        
+        batch_size = emb_left.size(0)
+        
+        # 计算相似度矩阵
+        sim_matrix = torch.mm(emb_left, emb_right.t()) / self.base_temperature
+        
+        labels = torch.arange(batch_size, device=self.device)
+        
+        # 计算每个样本的损失
+        loss_per_sample = self.ce_loss(sim_matrix, labels)
+        
+        # 如果有可靠性分数，进行加权
+        if reliability_scores is not None:
+            # 获取训练样本的可靠性分数
+            rel_left = reliability_scores[train_links[:, 0]]
+            rel_right = reliability_scores[train_links[:, 1]]
+            sample_weights = (rel_left + rel_right) / 2
+            
+            # 归一化权重
+            sample_weights = sample_weights / (sample_weights.sum() + 1e-8) * batch_size
+            
+            weighted_loss = (loss_per_sample * sample_weights).mean()
+        else:
+            weighted_loss = loss_per_sample.mean()
+        
+        return weighted_loss
+
+
 class CLIPAlignmentLoss(nn.Module):
     """修正的CLIP对齐损失函数"""
     
@@ -70,10 +307,6 @@ class CLIPAlignmentLoss(nn.Module):
     def forward(self, clip_features, train_links):
         """
         计算CLIP风格的对比学习损失
-        
-        Args:
-            clip_features: dict包含'image_embeds'和'text_embeds'
-            train_links: 训练链接 [M, 2]
         """
         if not isinstance(clip_features, dict):
             return torch.tensor(0.0, device=self.device)
@@ -87,34 +320,26 @@ class CLIPAlignmentLoss(nn.Module):
         if img_embeds is None or text_embeds is None:
             return torch.tensor(0.0, device=self.device)
         
-        # 确保tensor在正确的设备上
         img_embeds = img_embeds.to(self.device)
         text_embeds = text_embeds.to(self.device)
         
-        # 归一化特征
         img_embeds = F.normalize(img_embeds, dim=-1)
         text_embeds = F.normalize(text_embeds, dim=-1)
         
-        # 确保batch size一致
         min_batch_size = min(img_embeds.size(0), text_embeds.size(0))
         img_embeds = img_embeds[:min_batch_size]
         text_embeds = text_embeds[:min_batch_size]
         
-        # 对于同一实体，图像特征和文本特征应该相似
-        # 这里我们假设img_embeds[i]和text_embeds[i]对应同一实体
         batch_size = img_embeds.size(0)
         
         if batch_size == 0:
             return torch.tensor(0.0, device=self.device)
         
-        # 计算图像到文本的相似度矩阵
         sim_i2t = torch.matmul(img_embeds, text_embeds.T) / self.temperature
         sim_t2i = torch.matmul(text_embeds, img_embeds.T) / self.temperature
         
-        # 对角线应该是正样本（同一实体的不同模态）
         labels = torch.arange(batch_size, device=self.device)
         
-        # 计算双向对比损失
         loss_i2t = self.ce_loss(sim_i2t, labels)
         loss_t2i = self.ce_loss(sim_t2i, labels)
         
@@ -134,11 +359,6 @@ class CrossModalAlignmentLoss(nn.Module):
     def forward(self, embeddings, train_links, modal_features=None):
         """
         跨模态对齐损失
-        
-        Args:
-            embeddings: 融合后的实体嵌入 [N, D]
-            train_links: 训练对齐链接 [M, 2]
-            modal_features: 各模态特征字典（可选）
         """
         if embeddings is None:
             return torch.tensor(0.0, device=self.device)
@@ -149,15 +369,13 @@ class CrossModalAlignmentLoss(nn.Module):
             
             # 1. 主要的实体对齐损失
             embeddings = F.normalize(embeddings, dim=-1)
-            left_embeds = embeddings[train_links[:, 0]]   # 左侧KG的实体
-            right_embeds = embeddings[train_links[:, 1]]  # 右侧KG的实体
+            left_embeds = embeddings[train_links[:, 0]]
+            right_embeds = embeddings[train_links[:, 1]]
             
-            # 计算相似度矩阵
             sim_matrix = torch.matmul(left_embeds, right_embeds.T) / self.temperature
             batch_size = sim_matrix.size(0)
             labels = torch.arange(batch_size, device=self.device)
             
-            # 双向对比损失
             loss_l2r = self.ce_loss(sim_matrix, labels)
             loss_r2l = self.ce_loss(sim_matrix.T, labels)
             
@@ -165,100 +383,75 @@ class CrossModalAlignmentLoss(nn.Module):
             total_loss += alignment_loss
             loss_count += 1
             
-            # 2. 跨模态一致性损失（如果提供了模态特征）
+            # 2. 跨模态一致性损失
             if modal_features is not None and isinstance(modal_features, dict):
                 modal_consistency_loss = 0.0
                 modal_count = 0
                 
-                # 获取有效的模态特征
                 valid_modals = {k: v for k, v in modal_features.items() 
                               if v is not None and k != 'clip'}
                 
-                # 计算不同模态之间的一致性
                 modal_list = list(valid_modals.values())
-                modal_names = list(valid_modals.keys())
                 
                 for i in range(len(modal_list)):
                     for j in range(i + 1, len(modal_list)):
                         try:
-                            # 确保特征维度一致
                             feat_i = F.normalize(modal_list[i], dim=-1)
                             feat_j = F.normalize(modal_list[j], dim=-1)
                             
-                            # 确保batch size一致
                             min_size = min(feat_i.size(0), feat_j.size(0))
                             feat_i = feat_i[:min_size]
                             feat_j = feat_j[:min_size]
                             
-                            # 确保训练链接索引不越界
                             valid_train_links = train_links[train_links[:, 0] < min_size]
                             valid_train_links = valid_train_links[valid_train_links[:, 1] < min_size]
                             
                             if len(valid_train_links) == 0:
                                 continue
                             
-                            # 对齐实体应该在不同模态中也相似
                             feat_i_aligned = feat_i[valid_train_links[:, 0]]
                             feat_j_aligned = feat_j[valid_train_links[:, 1]]
                             
-                            # 计算对齐实体的余弦相似度
                             cosine_sim = F.cosine_similarity(feat_i_aligned, feat_j_aligned, dim=-1)
+                            consistency_loss = 1.0 - cosine_sim.mean()
                             
-                            # 鼓励对齐实体在不同模态中相似
-                            modal_loss = -torch.log(torch.sigmoid(cosine_sim) + 1e-8).mean()
-                            modal_consistency_loss += modal_loss
+                            modal_consistency_loss += consistency_loss
                             modal_count += 1
                             
                         except Exception as e:
-                            # 如果特征维度不匹配，跳过
                             continue
                 
                 if modal_count > 0:
-                    modal_consistency_loss /= modal_count
-                    total_loss += 0.1 * modal_consistency_loss  # 较小的权重
-                    loss_count += 1
+                    total_loss += 0.1 * modal_consistency_loss / modal_count
             
-            return total_loss / max(loss_count, 1)
+            return total_loss
             
         except Exception as e:
-            # 如果计算失败，返回零损失
             return torch.tensor(0.0, device=self.device)
 
 
 class CLIPAwareContrastiveLoss(nn.Module):
-    """CLIP感知的对比损失"""
+    """CLIP感知的对比学习损失"""
     
     def __init__(self, device, temperature=0.07, clip_weight=0.1, entity_weight=1.0):
         super(CLIPAwareContrastiveLoss, self).__init__()
         self.device = device
-        self.temperature = temperature
-        self.clip_weight = clip_weight
-        self.entity_weight = entity_weight
-        self.ce_loss = nn.CrossEntropyLoss()
-        
-        # 组件损失
         self.clip_loss = CLIPAlignmentLoss(device, temperature)
         self.alignment_loss = CrossModalAlignmentLoss(device, temperature)
+        self.clip_weight = clip_weight
+        self.entity_weight = entity_weight
     
     def forward(self, joint_embeddings, train_links, clip_features=None, modal_features=None):
         """
-        综合损失函数
-        
-        Args:
-            joint_embeddings: 融合后的实体嵌入 [N, D]
-            train_links: 训练对齐链接 [M, 2]
-            clip_features: CLIP特征字典 (可选)
-            modal_features: 各模态特征字典 (可选)
+        计算综合损失
         """
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=self.device)
         
         try:
-            # 1. 主要的实体对齐损失
             if joint_embeddings is not None:
                 entity_loss = self.alignment_loss(joint_embeddings, train_links, modal_features)
                 total_loss += self.entity_weight * entity_loss
             
-            # 2. CLIP对齐损失
             if clip_features is not None and self.clip_weight > 0:
                 clip_loss = self.clip_loss(clip_features, train_links)
                 total_loss += self.clip_weight * clip_loss
@@ -266,7 +459,6 @@ class CLIPAwareContrastiveLoss(nn.Module):
             return total_loss
             
         except Exception as e:
-            # 如果计算失败，返回零损失
             return torch.tensor(0.0, device=self.device)
 
 
@@ -279,12 +471,7 @@ class VIBLoss(nn.Module):
         self.beta = beta
     
     def forward(self, kld_losses):
-        """
-        计算VIB损失
-        
-        Args:
-            kld_losses: KL散度损失字典
-        """
+        """计算VIB损失"""
         try:
             total_kld = 0.0
             count = 0
@@ -310,23 +497,14 @@ class AdaptiveLossWeighting(nn.Module):
         super(AdaptiveLossWeighting, self).__init__()
         self.device = device
         self.num_losses = num_losses
-        
-        # 可学习的权重参数
         self.log_vars = nn.Parameter(torch.zeros(num_losses))
     
     def forward(self, losses):
-        """
-        计算加权损失
-        
-        Args:
-            losses: 损失列表
-        """
+        """计算加权损失"""
         try:
             if len(losses) != self.num_losses:
-                # 如果损失数量不匹配，使用简单平均
                 return sum(losses) / max(len(losses), 1)
             
-            # 使用不确定性加权
             weighted_losses = []
             for i, loss in enumerate(losses):
                 precision = torch.exp(-self.log_vars[i])
@@ -336,24 +514,48 @@ class AdaptiveLossWeighting(nn.Module):
             return sum(weighted_losses)
             
         except Exception as e:
-            # 如果计算失败，返回简单平均
             return sum(losses) / max(len(losses), 1)
 
 
-class ComprehensiveLoss(nn.Module):
-    """综合损失函数，整合所有损失项"""
+class ImprovedComprehensiveLoss(nn.Module):
+    """
+    改进的综合损失函数
+    主要改进：
+    1. 硬负样本挖掘
+    2. 跨模态一致性损失
+    3. 模态可靠性加权
+    """
     
     def __init__(self, args, device):
-        super(ComprehensiveLoss, self).__init__()
+        super(ImprovedComprehensiveLoss, self).__init__()
         self.args = args
         self.device = device
         
-        # 基础损失函数
-        self.info_nce = InfoNCE_loss(device, temperature=args.tau)
-        self.ms_loss = MsLoss(device, 
-                             thresh=getattr(args, 'ms_base', 0.5),
-                             scale_pos=getattr(args, 'ms_alpha', 0.1), 
-                             scale_neg=getattr(args, 'ms_beta', 40.0))
+        # 基础损失函数 - 使用改进版本
+        self.hard_nce = HardNegativeInfoNCE(
+            device, 
+            temperature=args.tau,
+            hard_negative_weight=getattr(args, 'hard_negative_weight', 0.5)
+        )
+        self.ms_loss = MsLoss(
+            device, 
+            thresh=getattr(args, 'ms_base', 0.5),
+            scale_pos=getattr(args, 'ms_alpha', 0.1), 
+            scale_neg=getattr(args, 'ms_beta', 40.0)
+        )
+        
+        # 跨模态一致性损失
+        self.cross_modal_loss = CrossModalConsistencyLoss(
+            device,
+            temperature=0.1,
+            consistency_weight=getattr(args, 'cross_modal_weight', 0.3)
+        )
+        
+        # 模态可靠性加权损失
+        self.reliability_weighted_loss = ModalityReliabilityWeightedLoss(
+            device,
+            base_temperature=args.tau
+        )
         
         # CLIP相关损失
         if getattr(args, 'use_clip', False):
@@ -367,58 +569,52 @@ class ComprehensiveLoss(nn.Module):
         # VIB损失
         self.vib_loss = VIBLoss(device, beta=0.001)
         
-        # 损失权重
+        # 自适应权重
         self.use_adaptive_weighting = getattr(args, 'use_adaptive_weighting', False)
         if self.use_adaptive_weighting:
-            # 计算可能的损失数量
             num_losses = 0
             if args.w_gcn: num_losses += 1
             if args.w_img: num_losses += 1
             if args.w_rel: num_losses += 1
             if args.w_attr: num_losses += 1
             if getattr(args, 'use_clip', False): num_losses += 1
-            num_losses += 1  # joint loss
+            num_losses += 2  # joint loss + cross modal loss
             
             self.adaptive_weighting = AdaptiveLossWeighting(num_losses, device)
     
     def forward(self, embeddings_dict, train_links, model):
         """
         计算综合损失
-        
-        Args:
-            embeddings_dict: 包含各种嵌入的字典
-            train_links: 训练链接
-            model: 模型实例（用于获取KLD损失和CLIP特征）
         """
         try:
             total_loss = 0.0
             loss_components = {}
             individual_losses = []
             
-            # 1. 各模态的损失
+            # 1. 各模态的损失（使用硬负样本挖掘）
             if self.args.w_gcn and 'graph' in embeddings_dict and embeddings_dict['graph'] is not None:
-                gph_loss = self.info_nce(embeddings_dict['graph'], train_links)
+                gph_loss = self.hard_nce(embeddings_dict['graph'], train_links)
                 if hasattr(model, 'kld_loss') and model.kld_loss > 0:
                     gph_loss += self.args.Beta_g * model.kld_loss
                 loss_components['graph'] = gph_loss
                 individual_losses.append(gph_loss)
             
             if self.args.w_img and 'image' in embeddings_dict and embeddings_dict['image'] is not None:
-                img_loss = self.info_nce(embeddings_dict['image'], train_links)
+                img_loss = self.hard_nce(embeddings_dict['image'], train_links)
                 if hasattr(model, 'img_kld_loss') and model.img_kld_loss > 0:
                     img_loss += self.args.Beta_i * model.img_kld_loss
                 loss_components['image'] = img_loss
                 individual_losses.append(img_loss)
             
             if self.args.w_rel and 'relation' in embeddings_dict and embeddings_dict['relation'] is not None:
-                rel_loss = self.info_nce(embeddings_dict['relation'], train_links)
+                rel_loss = self.hard_nce(embeddings_dict['relation'], train_links)
                 if hasattr(model, 'rel_kld_loss') and model.rel_kld_loss > 0:
                     rel_loss += self.args.Beta_r * model.rel_kld_loss
                 loss_components['relation'] = rel_loss
                 individual_losses.append(rel_loss)
             
             if self.args.w_attr and 'attribute' in embeddings_dict and embeddings_dict['attribute'] is not None:
-                attr_loss = self.info_nce(embeddings_dict['attribute'], train_links)
+                attr_loss = self.hard_nce(embeddings_dict['attribute'], train_links)
                 if hasattr(model, 'attr_kld_loss') and model.attr_kld_loss > 0:
                     attr_loss += self.args.Beta_a * model.attr_kld_loss
                 loss_components['attribute'] = attr_loss
@@ -438,7 +634,7 @@ class ComprehensiveLoss(nn.Module):
             # 3. 联合损失
             if 'joint' in embeddings_dict and embeddings_dict['joint'] is not None:
                 if getattr(self.args, 'use_joint_vib', False):
-                    joint_loss = self.info_nce(embeddings_dict['joint'], train_links)
+                    joint_loss = self.hard_nce(embeddings_dict['joint'], train_links)
                     if hasattr(model, 'joint_kld_loss') and model.joint_kld_loss > 0:
                         joint_loss += getattr(self.args, 'joint_beta', 1.0) * model.joint_kld_loss
                 else:
@@ -448,7 +644,20 @@ class ComprehensiveLoss(nn.Module):
                 loss_components['joint'] = joint_loss
                 individual_losses.append(joint_loss)
             
-            # 4. 组合损失
+            # 4. 跨模态一致性损失（新增！）
+            if hasattr(model, 'modal_features') and model.modal_features:
+                cross_modal_loss = self.cross_modal_loss(model.modal_features, train_links)
+                loss_components['cross_modal'] = cross_modal_loss
+                individual_losses.append(cross_modal_loss)
+            
+            # 5. 跨模态对齐损失（从模型获取）
+            if hasattr(model, 'get_cross_modal_alignment_loss'):
+                alignment_loss = model.get_cross_modal_alignment_loss(train_links)
+                if alignment_loss > 0:
+                    loss_components['alignment'] = alignment_loss
+                    individual_losses.append(0.2 * alignment_loss)
+            
+            # 6. 组合损失
             if self.use_adaptive_weighting and len(individual_losses) > 1:
                 total_loss = self.adaptive_weighting(individual_losses)
             else:
@@ -457,5 +666,9 @@ class ComprehensiveLoss(nn.Module):
             return total_loss, loss_components
             
         except Exception as e:
-            # 如果计算失败，返回零损失
+            print(f"Loss computation error: {e}")
             return torch.tensor(0.0, device=self.device), {}
+
+
+# 保持向后兼容
+ComprehensiveLoss = ImprovedComprehensiveLoss
