@@ -322,19 +322,37 @@ class KACEA:
             "--w_gcn", action="store_true", default=True, help="with gcn features"
         )
         parser.add_argument(
+            "--no_gcn", action="store_true", default=False, help="disable gcn features"
+        )
+        parser.add_argument(
             "--w_rel", action="store_true", default=True, help="with rel features"
+        )
+        parser.add_argument(
+            "--no_rel", action="store_true", default=False, help="disable rel features"
         )
         parser.add_argument(
             "--w_attr", action="store_true", default=True, help="with attr features"
         )
         parser.add_argument(
+            "--no_attr", action="store_true", default=False, help="disable attr features"
+        )
+        parser.add_argument(
             "--w_name", action="store_true", default=True, help="with name features"
+        )
+        parser.add_argument(
+            "--no_name", action="store_true", default=False, help="disable name features"
         )
         parser.add_argument(
             "--w_char", action="store_true", default=True, help="with char features"
         )
         parser.add_argument(
+            "--no_char", action="store_true", default=False, help="disable char features"
+        )
+        parser.add_argument(
             "--w_img", action="store_true", default=True, help="with img features"
+        )
+        parser.add_argument(
+            "--no_img", action="store_true", default=False, help="disable img features"
         )
         
         # VIB参数
@@ -539,7 +557,23 @@ class KACEA:
             help="weight for cross-modal consistency loss"
         )
         
-        return parser.parse_args()
+        args = parser.parse_args()
+        
+        # 处理 no_xxx 参数覆盖 w_xxx
+        if hasattr(args, 'no_gcn') and args.no_gcn:
+            args.w_gcn = False
+        if hasattr(args, 'no_rel') and args.no_rel:
+            args.w_rel = False
+        if hasattr(args, 'no_attr') and args.no_attr:
+            args.w_attr = False
+        if hasattr(args, 'no_name') and args.no_name:
+            args.w_name = False
+        if hasattr(args, 'no_char') and args.no_char:
+            args.w_char = False
+        if hasattr(args, 'no_img') and args.no_img:
+            args.w_img = False
+            
+        return args
 
     @staticmethod
     def set_seed(seed, cuda=True):
