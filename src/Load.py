@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-改进的数据加载模块
+改进的数据加载模块 - 增强版
 主要改进：
 1. 图像特征缺失的智能处理
 2. 图像质量标记
 3. 跨KG图像对齐预处理
+4. [新增] 增强版关系特征 - 区分入度/出度、头/尾实体角色
 """
 
 import numpy as np
@@ -112,7 +113,7 @@ def load_attr(fns, e, ent2id, topA=1000):
 
 
 def load_relation(e, KG, topR=1000):
-    """加载关系特征"""
+    """加载关系特征（基础版本）"""
     try:
         rel_mat = np.zeros((e, topR), dtype=np.float32)
         rels = np.array(KG)[:, 1]
@@ -130,6 +131,80 @@ def load_relation(e, KG, topR=1000):
     except Exception as e:
         print(f"Warning: Failed to load relation features: {e}")
         return np.zeros((e, topR), dtype=np.float32)
+
+
+def load_relation_enhanced(e, KG, topR=1000):
+    """
+    [新增] 增强的关系特征加载
+    改进点：
+    1. 区分作为头实体和尾实体时的关系
+    2. 添加入度和出度统计
+    3. 添加关系多样性特征
+    4. 归一化处理
+    
+    特征维度: topR * 2 (头/尾) + 4 (度数统计)
+    """
+    print("Loading enhanced relation features...")
+    
+    try:
+        feature_dim = topR * 2 + 4  # 头关系 + 尾关系 + 入度 + 出度 + 关系多样性(头) + 关系多样性(尾)
+        rel_mat = np.zeros((e, feature_dim), dtype=np.float32)
+        
+        # 统计关系频率
+        rels = np.array(KG)[:, 1]
+        top_rels = Counter(rels).most_common(topR)
+        rel_index_dict = {r: i for i, (r, cnt) in enumerate(top_rels)}
+        
+        # 统计度数和关系集合
+        in_degree = np.zeros(e, dtype=np.float32)
+        out_degree = np.zeros(e, dtype=np.float32)
+        head_relations = defaultdict(set)  # 每个实体作为头时的关系集合
+        tail_relations = defaultdict(set)  # 每个实体作为尾时的关系集合
+        
+        for tri in KG:
+            h, r, o = tri[0], tri[1], tri[2]
+            
+            if h < e and o < e:
+                out_degree[h] += 1
+                in_degree[o] += 1
+                
+                head_relations[h].add(r)
+                tail_relations[o].add(r)
+                
+                if r in rel_index_dict:
+                    # 作为头实体时的关系（前topR维）
+                    rel_mat[h][rel_index_dict[r]] += 1.0
+                    # 作为尾实体时的关系（topR到2*topR维）
+                    rel_mat[o][rel_index_dict[r] + topR] += 1.0
+        
+        # 添加度数特征（归一化）
+        max_in = max(in_degree.max(), 1)
+        max_out = max(out_degree.max(), 1)
+        
+        rel_mat[:, -4] = np.log1p(in_degree) / np.log1p(max_in)  # 归一化入度
+        rel_mat[:, -3] = np.log1p(out_degree) / np.log1p(max_out)  # 归一化出度
+        
+        # 添加关系多样性特征
+        for i in range(e):
+            rel_mat[i, -2] = len(head_relations[i]) / max(topR, 1)  # 作为头时的关系多样性
+            rel_mat[i, -1] = len(tail_relations[i]) / max(topR, 1)  # 作为尾时的关系多样性
+        
+        # 对关系频率部分进行行归一化
+        row_sum = rel_mat[:, :topR*2].sum(axis=1, keepdims=True)
+        row_sum = np.where(row_sum == 0, 1, row_sum)
+        rel_mat[:, :topR*2] = rel_mat[:, :topR*2] / row_sum
+        
+        print(f"Enhanced relation features: shape={rel_mat.shape}")
+        print(f"  Avg in-degree: {in_degree.mean():.2f}, Avg out-degree: {out_degree.mean():.2f}")
+        print(f"  Avg head relation diversity: {np.mean([len(s) for s in head_relations.values()]):.2f}")
+        print(f"  Avg tail relation diversity: {np.mean([len(s) for s in tail_relations.values()]):.2f}")
+        
+        return rel_mat.astype(np.float32)
+        
+    except Exception as e:
+        print(f"Warning: Failed to load enhanced relation features: {e}")
+        print("Falling back to basic relation features")
+        return load_relation(e, KG, topR)
 
 
 def load_json_embd(path):
@@ -178,8 +253,7 @@ def load_img(e_num, path):
 def load_img_new(e_num, path, triples):
     """
     加载图像特征（增强版本）
-    改进：对于缺失图像，不再使用随机噪声，而是使用零向量
-    并返回图像质量标记
+    改进：对于缺失图像，使用邻居图像平均或全局平均
     """
     if not os.path.exists(path):
         print(f"Warning: Image feature file {path} not found, creating zero features")
@@ -208,31 +282,27 @@ def load_img_new(e_num, path, triples):
         feature_dim = mean.shape[0]
         
         img_embd = []
-        has_real_image = []  # 标记哪些实体有真实图像
+        has_real_image = []
         follow_neighbor_img_num = 0
         follow_zero_num = 0
         
         for i in range(e_num):
             if i in img_dict:
-                # 有真实图像
                 img_embd.append(img_dict[i])
                 has_real_image.append(True)
             else:
                 if len(neighbor_list[i]) > 0:
-                    # 使用邻居图像的平均（只取有图像的邻居）
                     neighbor_imgs = [img_dict[n] for n in neighbor_list[i] if n in img_dict]
                     if len(neighbor_imgs) > 0:
                         follow_neighbor_img_num += 1
                         neighbor_mean = np.mean(neighbor_imgs, axis=0)
                         img_embd.append(neighbor_mean)
-                        has_real_image.append(True)  # 使用邻居图像也算有效
+                        has_real_image.append(True)
                     else:
-                        # 没有有效邻居，使用全局平均（而不是随机噪声）
                         follow_zero_num += 1
-                        img_embd.append(mean)  # 使用全局平均而非随机噪声
+                        img_embd.append(mean)
                         has_real_image.append(False)
                 else:
-                    # 没有邻居，使用全局平均
                     follow_zero_num += 1
                     img_embd.append(mean)
                     has_real_image.append(False)
@@ -254,11 +324,6 @@ def load_img_new(e_num, path, triples):
 def load_img_with_quality_mask(e_num, path, triples):
     """
     加载图像特征，同时返回质量掩码
-    质量掩码用于在训练时降低缺失图像的权重
-    
-    Returns:
-        img_features: [e_num, feature_dim] 图像特征
-        quality_mask: [e_num] 质量分数 (1.0=真实图像, 0.5=邻居平均, 0.0=全局平均)
     """
     if not os.path.exists(path):
         print(f"Warning: Image feature file {path} not found")
@@ -270,7 +335,6 @@ def load_img_with_quality_mask(e_num, path, triples):
         if len(img_dict) == 0:
             return np.zeros((e_num, 2048), dtype=np.float32), np.zeros(e_num, dtype=np.float32)
         
-        # 构建邻居关系
         neighbor_list = defaultdict(list)
         for triple in triples:
             head = triple[0]
@@ -291,18 +355,17 @@ def load_img_with_quality_mask(e_num, path, triples):
         for i in range(e_num):
             if i in img_dict:
                 img_embd.append(img_dict[i])
-                quality_mask.append(1.0)  # 真实图像
+                quality_mask.append(1.0)
             else:
                 neighbor_imgs = [img_dict[n] for n in neighbor_list[i] if n in img_dict]
                 if len(neighbor_imgs) > 0:
                     neighbor_mean = np.mean(neighbor_imgs, axis=0)
                     img_embd.append(neighbor_mean)
-                    # 质量分数基于邻居数量
                     quality = min(0.8, 0.3 + 0.1 * len(neighbor_imgs))
                     quality_mask.append(quality)
                 else:
                     img_embd.append(mean)
-                    quality_mask.append(0.1)  # 全局平均，最低质量
+                    quality_mask.append(0.1)
         
         coverage = sum(1 for q in quality_mask if q >= 0.5) / e_num * 100
         print(f"Image coverage (quality >= 0.5): {coverage:.2f}%")
@@ -315,9 +378,7 @@ def load_img_with_quality_mask(e_num, path, triples):
 
 
 def load_entity_texts(file_dir, ent2id_dict):
-    """
-    加载实体名称用于CLIP文本编码
-    """
+    """加载实体名称用于CLIP文本编码"""
     print("Loading entity names for CLIP text encoding...")
     
     id2name = {}
@@ -382,12 +443,9 @@ def prepare_clip_text_inputs(entity_texts, max_length=77):
 
 
 def load_name_features(e_num, entity_files, ent2id_dict, feature_dim=300):
-    """
-    加载实体名称特征（基于字符n-gram或预训练词向量）
-    """
+    """加载实体名称特征"""
     print("Loading name features...")
     
-    # 收集所有实体名称
     id2name = {}
     for file_path in entity_files:
         try:
@@ -400,7 +458,6 @@ def load_name_features(e_num, entity_files, ent2id_dict, feature_dim=300):
                         ent_id = int(parts[0])
                         ent_name = parts[1]
                         
-                        # 清理名称
                         if "/" in ent_name:
                             ent_name = ent_name.split("/")[-1]
                         if "#" in ent_name:
@@ -411,16 +468,13 @@ def load_name_features(e_num, entity_files, ent2id_dict, feature_dim=300):
         except Exception as e:
             print(f"Warning: Failed to load names from {file_path}: {e}")
     
-    # 创建字符级特征
     features = np.zeros((e_num, feature_dim), dtype=np.float32)
     
     for i in range(e_num):
         if i in id2name:
             name = id2name[i]
-            # 简单的字符级哈希特征
             for j, char in enumerate(name[:feature_dim]):
                 features[i][j % feature_dim] += ord(char) / 255.0
-            # 归一化
             norm = np.linalg.norm(features[i])
             if norm > 0:
                 features[i] /= norm
@@ -429,9 +483,7 @@ def load_name_features(e_num, entity_files, ent2id_dict, feature_dim=300):
 
 
 def load_char_features(e_num, entity_files, ent2id_dict, feature_dim=100):
-    """
-    加载字符级特征
-    """
+    """加载字符级特征"""
     print("Loading character features...")
     
     id2name = {}
@@ -455,21 +507,17 @@ def load_char_features(e_num, entity_files, ent2id_dict, feature_dim=100):
         except Exception as e:
             print(f"Warning: Failed to load names from {file_path}: {e}")
     
-    # 字符n-gram特征
     features = np.zeros((e_num, feature_dim), dtype=np.float32)
     
     for i in range(e_num):
         if i in id2name:
             name = id2name[i]
-            # 字符2-gram和3-gram
             for n in [2, 3]:
                 for j in range(len(name) - n + 1):
                     ngram = name[j:j+n]
-                    # 哈希到特征维度
                     idx = hash(ngram) % feature_dim
                     features[i][idx] += 1.0
             
-            # 归一化
             norm = np.linalg.norm(features[i])
             if norm > 0:
                 features[i] /= norm
@@ -547,8 +595,12 @@ def safe_load_features(load_path, feature_name):
 
 
 def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples, 
-                                   use_cache=True, cache_dir="cache"):
-    """带缓存的多模态数据加载"""
+                                   use_cache=True, cache_dir="cache",
+                                   use_enhanced_rel=True):
+    """
+    带缓存的多模态数据加载
+    [新增] use_enhanced_rel: 是否使用增强版关系特征
+    """
     data_dict = {}
     
     if use_cache:
@@ -589,13 +641,17 @@ def load_multimodal_data_with_cache(file_dir, ent2id_dict, ent_num, triples,
         if use_cache:
             safe_save_features(data_dict['att_features'], attr_cache_path, "attribute")
     
-    # 关系特征
-    rel_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_rel_features.npy")
+    # [改进] 关系特征 - 支持增强版
+    rel_suffix = "_enhanced" if use_enhanced_rel else ""
+    rel_cache_path = os.path.join(cache_dir, f"{os.path.basename(file_dir)}_rel_features{rel_suffix}.npy")
     if use_cache and os.path.exists(rel_cache_path):
         data_dict['rel_features'] = safe_load_features(rel_cache_path, "relation")
     
     if 'rel_features' not in data_dict or data_dict['rel_features'] is None:
-        data_dict['rel_features'] = load_relation(ent_num, triples, 1000)
+        if use_enhanced_rel:
+            data_dict['rel_features'] = load_relation_enhanced(ent_num, triples, 1000)
+        else:
+            data_dict['rel_features'] = load_relation(ent_num, triples, 1000)
         
         if use_cache:
             safe_save_features(data_dict['rel_features'], rel_cache_path, "relation")
@@ -651,10 +707,7 @@ def check_feature_integrity(features, feature_name, expected_shape):
 
 
 def analyze_image_coverage(e_num, path, left_ents, right_ents):
-    """
-    分析图像覆盖情况
-    分别统计两个KG的图像覆盖率
-    """
+    """分析图像覆盖情况"""
     if not os.path.exists(path):
         print(f"Image file not found: {path}")
         return

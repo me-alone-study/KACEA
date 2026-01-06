@@ -1,5 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+改进的 KACEA 训练主文件
+主要改进：
+1. 新增 Early Stopping 功能
+2. 支持增强版关系特征
+3. 支持 ResidualGCN
+4. 优化迭代学习策略
+5. 改进的温度参数
+"""
 from __future__ import absolute_import
 from __future__ import unicode_literals
 from __future__ import division
@@ -126,7 +135,7 @@ class KACEA:
         self.att_features = None
         self.char_features = None
         self.name_features = None
-        self.entity_texts = None  # 新增：实体文本用于CLIP
+        self.entity_texts = None
         
         # 训练相关属性
         self.ent_vec = None
@@ -189,8 +198,13 @@ class KACEA:
             exp_name += "_frozen"
         else:
             exp_name += "_finetune"
+        
+        # [新增] 标记使用的特性
+        if getattr(self.args, 'use_enhanced_rel', False):
+            exp_name += "_enhrel"
+        if getattr(self.args, 'use_residual_gcn', False):
+            exp_name += "_resgcn"
             
-        # 创建logs文件夹（与src同级）
         logs_dir = "logs"
         os.makedirs(logs_dir, exist_ok=True)
         
@@ -199,7 +213,6 @@ class KACEA:
         
         log_file = os.path.join(log_dir, "training.log")
         
-        # 保存配置
         config = {k: v for k, v in vars(self.args).items() 
                  if isinstance(v, (str, int, float, bool))}
         with open(os.path.join(log_dir, "config.json"), 'w') as f:
@@ -223,7 +236,7 @@ class KACEA:
             type=str,
             default="data/DBP15K/zh_en",
             required=False,
-            help="input dataset file directory, ('data/DBP15K/zh_en', 'data/DWY100K/dbp_wd')",
+            help="input dataset file directory",
         )
         parser.add_argument("--rate", type=float, default=0.3, help="training set rate")
         parser.add_argument(
@@ -243,13 +256,13 @@ class KACEA:
             "--hidden_units",
             type=str,
             default="128,128,128",
-            help="hidden units in each hidden layer(including in_dim and out_dim), splitted with comma",
+            help="hidden units in each hidden layer",
         )
         parser.add_argument(
             "--heads",
             type=str,
             default="2,2",
-            help="heads in each gat layer, splitted with comma",
+            help="heads in each gat layer",
         )
         parser.add_argument(
             "--instance_normalization",
@@ -261,8 +274,8 @@ class KACEA:
             "--structure_encoder",
             type=str,
             default="gat",
-            choices=["gcn", "gat"],  # 移除了gnn_enhanced选项
-            help="the encoder of structure view, [gcn|gat]",
+            choices=["gcn", "gat"],
+            help="the encoder of structure view",
         )
         
         # 训练参数
@@ -273,10 +286,10 @@ class KACEA:
             "--weight_decay",
             type=float,
             default=1e-2,
-            help="weight decay (L2 loss on parameters)",
+            help="weight decay",
         )
         parser.add_argument(
-            "--dropout", type=float, default=0.0, help="dropout rate for layers"
+            "--dropout", type=float, default=0.0, help="dropout rate"
         )
         parser.add_argument(
             "--attn_dropout",
@@ -396,7 +409,7 @@ class KACEA:
             "--with_weight",
             type=int,
             default=1,
-            help="Whether to weight the fusion of different modal features",
+            help="Whether to weight the fusion",
         )
         parser.add_argument(
             "--fusion_id", type=int, default=1, help="default weight fusion"
@@ -431,7 +444,7 @@ class KACEA:
         
         # 评估参数
         parser.add_argument(
-            "--dist", type=int, default=2, help="L1 distance or L2 distance. ('1', '2')"
+            "--dist", type=int, default=2, help="L1 distance or L2 distance"
         )
         parser.add_argument(
             "--csls", action="store_true", default=False, help="use CSLS for inference"
@@ -446,10 +459,10 @@ class KACEA:
             "--semi_learn_step",
             type=int,
             default=10,
-            help="If IL, what's the update step?",
+            help="IL update step",
         )
         parser.add_argument(
-            "--il_start", type=int, default=500, help="If Il, when to start?"
+            "--il_start", type=int, default=500, help="IL start epoch"
         )
         
         # === CLIP相关参数 ===
@@ -501,7 +514,7 @@ class KACEA:
             "--word_embedding",
             type=str,
             default="glove",
-            help="the type of word embedding, [glove|fasttext]",
+            help="word embedding type",
         )
         
         # 保存参数
@@ -557,6 +570,70 @@ class KACEA:
             help="weight for cross-modal consistency loss"
         )
         
+        # ============================================
+        # [新增] 改进参数
+        # ============================================
+        
+        # Early Stopping 参数
+        parser.add_argument(
+            "--use_early_stopping",
+            action="store_true",
+            default=False,
+            help="enable early stopping"
+        )
+        parser.add_argument(
+            "--patience",
+            type=int,
+            default=100,
+            help="patience for early stopping (epochs without improvement)"
+        )
+        parser.add_argument(
+            "--min_delta",
+            type=float,
+            default=0.001,
+            help="minimum improvement to reset patience"
+        )
+        
+        # 增强模型参数
+        parser.add_argument(
+            "--use_residual_gcn",
+            action="store_true",
+            default=False,
+            help="use ResidualGCN instead of SimpleGCN"
+        )
+        parser.add_argument(
+            "--use_neighbor_agg",
+            action="store_true",
+            default=False,
+            help="use neighbor aggregation"
+        )
+        parser.add_argument(
+            "--use_enhanced_rel",
+            action="store_true",
+            default=False,
+            help="use enhanced relation features (head/tail + degree)"
+        )
+        
+        # 改进的损失函数参数
+        parser.add_argument(
+            "--triplet_margin",
+            type=float,
+            default=0.5,
+            help="margin for triplet loss in hard negative mining"
+        )
+        parser.add_argument(
+            "--use_confidence_weighting",
+            action="store_true",
+            default=False,
+            help="use confidence weighting in loss"
+        )
+        parser.add_argument(
+            "--confidence_threshold",
+            type=float,
+            default=0.5,
+            help="threshold for confidence weighting"
+        )
+        
         args = parser.parse_args()
         
         # 处理 no_xxx 参数覆盖 w_xxx
@@ -592,12 +669,14 @@ relation num:\t{self.REL_NUM}
 train ill num:\t{self.train_ill.shape[0]}\ttest ill num:\t{self.test_ill.shape[0]}
 CLIP enabled:\t{self.args.use_clip}
 Entity names:\t{self.args.use_entity_names}
+Enhanced Rel:\t{getattr(self.args, 'use_enhanced_rel', False)}
+ResidualGCN:\t{getattr(self.args, 'use_residual_gcn', False)}
+Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
 -------------------------"""
         self.log_print(summary_msg)
 
     def init_data(self):
         """初始化数据"""
-        # Load basic data
         lang_list = [1, 2]
         file_dir = self.args.file_dir
         device = self.device
@@ -634,11 +713,10 @@ Entity names:\t{self.args.use_entity_names}
             self.log_print(f"image feature shape: {self.img_features.shape}")
         except Exception as e:
             self.log_print(f"Warning: Failed to load image features: {e}")
-            # 创建随机图像特征作为备用
             self.img_features = F.normalize(torch.randn(self.ENT_NUM, 2048).to(device))
             self.log_print(f"Using random image features with shape: {self.img_features.shape}")
         
-        # 加载实体文本（用于CLIP）
+        # 加载实体文本
         if self.args.use_clip and self.args.use_entity_names:
             try:
                 self.entity_texts = load_entity_texts(file_dir, self.ent2id_dict)
@@ -700,9 +778,17 @@ Entity names:\t{self.args.use_entity_names}
         self.log_print(f"#left entity : {len(self.left_ents)}, #right entity: {len(self.right_ents)}")
         self.log_print(f"#left entity not in train set: {len(self.left_non_train)}, #right entity not in train set: {len(self.right_non_train)}")
         
-        # 加载关系特征
+        # [改进] 加载关系特征 - 支持增强版
         try:
-            self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
+            if getattr(self.args, 'use_enhanced_rel', False):
+                try:
+                    self.rel_features = load_relation_enhanced(self.ENT_NUM, self.triples, 1000)
+                    self.log_print("Using enhanced relation features (2004 dim)")
+                except Exception as e:
+                    self.log_print(f"Warning: Enhanced relation features failed: {e}, falling back to basic")
+                    self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
+            else:
+                self.rel_features = load_relation(self.ENT_NUM, self.triples, 1000)
             self.rel_features = torch.Tensor(self.rel_features).to(device)
             self.log_print(f"relation feature shape: {self.rel_features.shape}")
         except Exception as e:
@@ -732,7 +818,6 @@ Entity names:\t{self.args.use_entity_names}
             self.adj = self.adj.to(self.device)
         except Exception as e:
             self.log_print(f"Warning: Failed to load adjacency matrix: {e}")
-            # 创建单位矩阵作为备用
             indices = torch.arange(self.ENT_NUM).long()
             indices = torch.stack([indices, indices])
             values = torch.ones(self.ENT_NUM)
@@ -747,10 +832,8 @@ Entity names:\t{self.args.use_entity_names}
             self.char_features.shape[1] if self.char_features is not None else 100
         )
         
-        # 设置设备信息到args中
         self.args.device = self.device
 
-        # 验证和修正参数
         if not hasattr(self.args, 'structure_encoder'):
             self.args.structure_encoder = "gat"
         
@@ -758,7 +841,6 @@ Entity names:\t{self.args.use_entity_names}
             self.log_print(f"Warning: Unknown structure_encoder {self.args.structure_encoder}, using 'gat'")
             self.args.structure_encoder = "gat"
         
-        # 检查CLIP可用性
         if self.args.use_clip and not CLIP_AVAILABLE:
             self.log_print("Warning: CLIP requested but transformers not available, disabling CLIP")
             self.args.use_clip = False
@@ -775,11 +857,9 @@ Entity names:\t{self.args.use_entity_names}
             ).to(self.device)
         except Exception as e:
             self.log_print(f"Error initializing model: {e}")
-            # 使用安全的默认参数重试
             self.args.use_clip = False
             self.args.use_comprehensive_loss = False
             self.args.use_project_head = False
-            # 禁用所有VIB
             self.args.use_graph_vib = False
             self.args.use_img_vib = False
             self.args.use_rel_vib = False
@@ -796,7 +876,6 @@ Entity names:\t{self.args.use_entity_names}
             
             self.log_print("Model initialized with safe defaults")
     
-        # 计算参数数量
         self.params = [{"params": list(self.multimodal_encoder.parameters())}]
         total_params = sum(
             p.numel()
@@ -805,12 +884,10 @@ Entity names:\t{self.args.use_entity_names}
         )
         self.log_print(f"Total trainable parameters: {total_params}")
     
-        # 初始化优化器
         self.optimizer = optim.AdamW(
             self.params, lr=self.args.lr, weight_decay=self.args.weight_decay
         )
     
-        # 初始化学习率调度器
         if self.args.use_sheduler:
             self.scheduler = optim.lr_scheduler.ExponentialLR(
                 optimizer=self.optimizer, gamma=self.args.sheduler_gamma
@@ -822,7 +899,6 @@ Entity names:\t{self.args.use_entity_names}
                 num_training_steps=self.args.num_training_steps,
             )
         
-        # 初始化损失函数
         ms_alpha = self.args.ms_alpha
         ms_beta = self.args.ms_beta
         ms_base = self.args.ms_base
@@ -831,20 +907,15 @@ Entity names:\t{self.args.use_entity_names}
         )
         self.criterion_nce = InfoNCE_loss(device=self.device, temperature=self.args.tau)
         
-        # 初始化综合损失函数（改进版本）
         if getattr(self.args, 'use_comprehensive_loss', False):
             try:
                 from loss import ImprovedComprehensiveLoss
                 self.comprehensive_loss = ImprovedComprehensiveLoss(self.args, self.device)
-                self.log_print("Using ImprovedComprehensiveLoss with hard negative mining and cross-modal consistency")
+                self.log_print("Using ImprovedComprehensiveLoss")
             except Exception as e:
                 self.log_print(f"Warning: Failed to initialize ImprovedComprehensiveLoss: {e}")
-                try:
-                    self.comprehensive_loss = ComprehensiveLoss(self.args, self.device)
-                except:
-                    self.args.use_comprehensive_loss = False
+                self.args.use_comprehensive_loss = False
         
-        # 初始化CLIP损失
         if self.args.use_clip:
             try:
                 self.clip_loss = CLIPAwareContrastiveLoss(
@@ -916,6 +987,16 @@ Entity names:\t{self.args.use_entity_names}
         Beta_r = self.args.Beta_r
         Beta_a = self.args.Beta_a
 
+        # [新增] Early Stopping 初始化
+        use_early_stopping = getattr(self.args, 'use_early_stopping', False)
+        patience = getattr(self.args, 'patience', 100)
+        min_delta = getattr(self.args, 'min_delta', 0.001)
+        no_improve_count = 0
+        best_metric_for_es = 0.0
+        
+        if use_early_stopping:
+            self.log_print(f"Early stopping enabled: patience={patience}, min_delta={min_delta}")
+
         for epoch in range(self.args.epochs):
             t_epoch = time.time()
             self.multimodal_encoder.train()
@@ -945,7 +1026,6 @@ Entity names:\t{self.args.use_entity_names}
                 current_links = self.train_ill[si : si + bsize]
                 
                 if getattr(self.args, 'use_comprehensive_loss', False) and self.comprehensive_loss is not None:
-                    # 使用综合损失函数
                     try:
                         embeddings_dict = {
                             'graph': gph_emb,
@@ -960,7 +1040,6 @@ Entity names:\t{self.args.use_entity_names}
                             embeddings_dict, current_links, self.multimodal_encoder
                         )
                         
-                        # 记录各组件损失
                         epoch_info = f"[epoch {epoch:4d}]"
                         for component, loss_val in loss_components.items():
                             epoch_info += f" {component}:{loss_val:.4f}"
@@ -970,7 +1049,6 @@ Entity names:\t{self.args.use_entity_names}
                         epoch_info = f"[epoch {epoch:4d}] comprehensive_loss_failed"
                     
                 else:
-                    # 使用传统的分别计算损失方式
                     loss_all = 0
                     epoch_info = f"[epoch {epoch:4d}]"
                     loss_list = []
@@ -1081,13 +1159,11 @@ Entity names:\t{self.args.use_entity_names}
                     if loss_list:
                         loss_all = sum(loss_list)
                     else:
-                        # 如果没有有效损失，创建一个小的dummy损失以保持训练继续
                         epoch_info += " [no_valid_loss, using_dummy]"
                         loss_all = torch.tensor(0.001, device=device, requires_grad=True)
                 
                 epoch_info += f" loss_all:{loss_all:.4f}"
                 
-                # 只在每个epoch的第一个batch记录详细信息，避免日志过多
                 if si == 0:
                     self.log_print(epoch_info, print_console=True)
                 else:
@@ -1173,6 +1249,23 @@ Entity names:\t{self.args.use_entity_names}
                 self.log_print(f"\n[epoch {epoch:4d}] checkpoint!")
                 self.test(epoch)
                 
+                # [新增] Early Stopping 检查
+                if use_early_stopping:
+                    current_metric = self.best_hit_1
+                    if current_metric > best_metric_for_es + min_delta:
+                        best_metric_for_es = current_metric
+                        no_improve_count = 0
+                        self.log_print(f"  [Early Stopping] New best: {best_metric_for_es:.4f}")
+                    else:
+                        no_improve_count += 1
+                        self.log_print(f"  [Early Stopping] No improvement for {no_improve_count} checkpoints")
+                    
+                    # 计算实际的patience（以checkpoint为单位）
+                    patience_in_checkpoints = patience // self.args.check_point
+                    if no_improve_count >= patience_in_checkpoints:
+                        self.log_print(f"\n[Early Stopping] Triggered at epoch {epoch}! Best H@1: {best_metric_for_es:.4f}")
+                        break
+                
             # 清理内存
             del joint_emb, gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb
             torch.cuda.empty_cache()
@@ -1181,7 +1274,6 @@ Entity names:\t{self.args.use_entity_names}
         self.log_print(f"best epoch is {self.best_epoch}, hits@1 hits@10 MRR MR is: {self.best_data_list}")
         self.log_print(f"[total time elapsed: {time.time() - t_total:.4f} s]")
         
-        # 保存最终结果
         self.save_final_results()
 
     def test(self, epoch):
@@ -1302,7 +1394,6 @@ Entity names:\t{self.args.use_entity_names}
                 acc_l2r[i] = round(acc_l2r[i] / self.test_left.size(0), 4)
                 acc_r2l[i] = round(acc_r2l[i] / self.test_right.size(0), 4)
             
-            # 记录结果
             result = {
                 'epoch': epoch,
                 'l2r_h1': float(acc_l2r[0]),
@@ -1329,7 +1420,6 @@ Entity names:\t{self.args.use_entity_names}
             )
             gc.collect()
             
-            # 输出测试结果（格式简洁）
             test_msg = f"epoch {epoch:4d} | l2r: h1={acc_l2r[0]:.4f} h10={acc_l2r[1]:.4f} mrr={mrr_l2r:.4f} mr={mean_l2r:.2f} | r2l: h1={acc_r2l[0]:.4f} h10={acc_r2l[1]:.4f} mrr={mrr_r2l:.4f} mr={mean_r2l:.2f} | t={time.time()-t_test:.2f}s"
             self.log_print(test_msg)
             
@@ -1357,9 +1447,8 @@ Entity names:\t{self.args.use_entity_names}
                     wr.writerows(self.best_to_write)
 
     def save_final_results(self):
-        """保存最终结果 - 修复JSON序列化错误"""
+        """保存最终结果"""
         
-        # 转换numpy类型为Python原生类型
         def convert_to_python_type(obj):
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
@@ -1401,7 +1490,6 @@ Entity names:\t{self.args.use_entity_names}
             self.log_print(final_msg)
         except Exception as e:
             self.log_print(f"Warning: Failed to save results: {e}")
-            # 保存简化版本
             simple_results = {
                 'best_hit1': float(self.best_data_list[0]) if self.best_data_list else 0.0,
                 'best_epoch': int(self.best_epoch)

@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-改进的多模态实体对齐模型
+改进的多模态实体对齐模型 - 增强版
 主要改进：
 1. 模态可靠性评估 - 自动检测缺失/低质量模态
 2. 自适应融合权重 - 实体级别的动态权重
 3. 跨模态对齐机制 - 强制模态间一致性
 4. 图像特征增强 - 更好的缺失处理策略
+5. [新增] ResidualGCN - 残差图卷积网络
+6. [新增] NeighborAggregator - 邻居信息聚合
+7. [新增] 低质量模态过滤机制
 """
 
 import math
@@ -43,6 +46,126 @@ class SimpleGCN(nn.Module):
         x = F.dropout(x, self.dropout, training=self.training)
         x = self.gc2(x, adj)
         return x
+
+
+class ResidualGCN(nn.Module):
+    """
+    [新增] 带残差连接的GCN - 更深的网络结构
+    改进点：
+    1. 增加网络深度（3层）
+    2. 添加残差连接防止梯度消失
+    3. 层归一化稳定训练
+    """
+    def __init__(self, nfeat, nhid, nclass, dropout, num_layers=3):
+        super(ResidualGCN, self).__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # 输入层
+        self.gc_input = GraphConvolution(nfeat, nhid)
+        self.ln_input = nn.LayerNorm(nhid)
+        
+        # 中间层（带残差）
+        self.gc_layers = nn.ModuleList()
+        self.ln_layers = nn.ModuleList()
+        for i in range(num_layers - 2):
+            self.gc_layers.append(GraphConvolution(nhid, nhid))
+            self.ln_layers.append(nn.LayerNorm(nhid))
+        
+        # 输出层
+        self.gc_output = GraphConvolution(nhid, nclass)
+        self.ln_output = nn.LayerNorm(nclass)
+        
+        # 残差投影（如果维度不匹配）
+        self.skip_connection = None
+        if nfeat != nclass:
+            self.skip_connection = nn.Linear(nfeat, nclass)
+
+    def forward(self, x, adj):
+        identity = x
+        
+        # 输入层
+        x = self.gc_input(x, adj)
+        x = self.ln_input(x)
+        x = F.relu(x)
+        x = F.dropout(x, self.dropout, training=self.training)
+        
+        # 中间层（带残差）
+        for gc, ln in zip(self.gc_layers, self.ln_layers):
+            residual = x
+            x = gc(x, adj)
+            x = ln(x)
+            x = F.relu(x)
+            x = F.dropout(x, self.dropout, training=self.training)
+            x = x + residual  # 残差连接
+        
+        # 输出层
+        x = self.gc_output(x, adj)
+        x = self.ln_output(x)
+        
+        # 全局残差连接
+        if self.skip_connection is not None:
+            identity = self.skip_connection(identity)
+        
+        return x + 0.1 * identity  # 加权残差
+
+
+class NeighborAggregator(nn.Module):
+    """
+    [新增] 邻居信息聚合模块
+    用于增强实体表示，特别适合跨KG对齐任务
+    """
+    def __init__(self, input_dim, output_dim, aggregation='mean'):
+        super(NeighborAggregator, self).__init__()
+        self.aggregation = aggregation
+        
+        # 自身特征变换
+        self.self_transform = nn.Linear(input_dim, output_dim)
+        
+        # 邻居特征变换
+        self.neighbor_transform = nn.Linear(input_dim, output_dim)
+        
+        # 组合变换
+        self.combine_transform = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU()
+        )
+        
+        # 注意力权重（可选）
+        self.attention = nn.Sequential(
+            nn.Linear(output_dim * 2, 1),
+            nn.LeakyReLU(0.2)
+        )
+        
+    def forward(self, x, adj):
+        """
+        Args:
+            x: 实体特征 [N, input_dim]
+            adj: 邻接矩阵 [N, N]
+        Returns:
+            enhanced: 增强后的特征 [N, output_dim]
+        """
+        # 自身特征
+        self_feat = self.self_transform(x)
+        
+        # 聚合邻居特征
+        if adj.is_sparse:
+            neighbor_sum = torch.sparse.mm(adj, x)
+            # 计算度数用于平均
+            degree = torch.sparse.sum(adj, dim=1).to_dense().unsqueeze(1).clamp(min=1)
+        else:
+            neighbor_sum = torch.mm(adj, x)
+            degree = adj.sum(dim=1, keepdim=True).clamp(min=1)
+        
+        neighbor_mean = neighbor_sum / degree
+        neighbor_feat = self.neighbor_transform(neighbor_mean)
+        
+        # 组合自身和邻居特征
+        combined = torch.cat([self_feat, neighbor_feat], dim=-1)
+        enhanced = self.combine_transform(combined)
+        
+        return enhanced
 
 
 class SimpleGAT(nn.Module):
@@ -84,14 +207,10 @@ class SimpleGAT(nn.Module):
             if x.size(0) > 20000:
                 x = self.simple_forward(x, adj, layer, n_head)
             else:
-                x = layer(x, adj)  # 返回 [n_head, N, f_out]
+                x = layer(x, adj)
                 
-                # 🔧 修复：正确处理多头输出维度
                 if x.dim() == 3 and x.size(0) == n_head:
-                    # 方案1: 多头平均
-                    x = x.mean(dim=0)  # [N, f_out]
-                    # 方案2: 或者拼接后投影 (需要额外参数)
-                    # x = x.transpose(0, 1).contiguous().view(N, -1)
+                    x = x.mean(dim=0)
                 
             if hasattr(self, 'norm_layers'):
                 x = self.norm_layers[i](x)
@@ -118,14 +237,7 @@ class SimpleGAT(nn.Module):
 
 
 class CLIPEntityEncoder(nn.Module):
-    """
-    修复的CLIP实体编码器
-    
-    🔧 修复：
-    1. 添加 encode_images_from_raw() 真正使用 CLIP 的 ViT 编码器
-    2. 改进 encode_images() 使用多层对齐网络（而非简单线性层）
-    3. 添加图像-文本相似度计算
-    """
+    """CLIP实体编码器"""
     
     def __init__(self, clip_model_name="openai/clip-vit-base-patch32", freeze_clip=True, device=None):
         super(CLIPEntityEncoder, self).__init__()
@@ -147,18 +259,10 @@ class CLIPEntityEncoder(nn.Module):
         
         self.clip_dim = self.clip_model.config.projection_dim
         self.image_projection = None
-        self.feature_aligner = None  # 🆕 多层特征对齐网络
+        self.feature_aligner = None
     
     def encode_images_from_raw(self, images):
-        """
-        🆕 从原始图像编码（真正使用ViT！）
-        
-        Args:
-            images: PIL Images 列表或已处理的 pixel_values tensor
-        
-        Returns:
-            image_features: [N, clip_dim] 归一化的图像特征
-        """
+        """从原始图像编码"""
         try:
             if isinstance(images, list):
                 inputs = self.clip_processor(images=images, return_tensors="pt")
@@ -166,7 +270,6 @@ class CLIPEntityEncoder(nn.Module):
             else:
                 pixel_values = images.to(self.device)
             
-            # 🔥 真正使用 CLIP 的 ViT 编码器！
             with torch.no_grad():
                 image_features = self.clip_model.get_image_features(pixel_values=pixel_values)
             
@@ -177,16 +280,11 @@ class CLIPEntityEncoder(nn.Module):
             return None
     
     def encode_images(self, image_features, use_alignment=True):
-        """
-        编码预提取的图像特征
-        
-        🔧 改进：使用多层感知机对齐到CLIP空间（而非简单线性层）
-        """
+        """编码预提取的图像特征"""
         input_dim = image_features.size(-1)
         
         if use_alignment:
             if self.feature_aligner is None or self.feature_aligner[0].in_features != input_dim:
-                # 多层对齐网络，比单个线性层效果更好
                 self.feature_aligner = nn.Sequential(
                     nn.Linear(input_dim, self.clip_dim * 2),
                     nn.LayerNorm(self.clip_dim * 2),
@@ -205,7 +303,7 @@ class CLIPEntityEncoder(nn.Module):
         return F.normalize(aligned, dim=-1)
     
     def encode_texts(self, texts):
-        """编码文本（使用CLIP的文本编码器）"""
+        """编码文本"""
         if isinstance(texts, str):
             texts = [texts]
         
@@ -237,31 +335,16 @@ class CLIPEntityEncoder(nn.Module):
         
         return F.normalize(text_outputs, dim=-1)
     
-    def compute_similarity(self, image_features, text_features):
-        """🆕 计算图像-文本相似度"""
-        image_features = F.normalize(image_features, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
-        return torch.matmul(image_features, text_features.T)
-    
     def forward(self, image_features=None, texts=None, raw_images=None):
-        """
-        前向传播
-        
-        Args:
-            image_features: 预提取的图像特征（可选）
-            texts: 实体文本（可选）
-            raw_images: 原始图像（可选，如果提供则使用ViT编码）
-        """
+        """前向传播"""
         results = {}
         
-        # 优先使用原始图像（真正的ViT编码）
         if raw_images is not None:
             vit_features = self.encode_images_from_raw(raw_images)
             if vit_features is not None:
                 results['image_embeds'] = vit_features
                 results['used_vit'] = True
         
-        # 如果没有原始图像，使用预提取特征
         if 'image_embeds' not in results and image_features is not None:
             results['image_embeds'] = self.encode_images(image_features)
             results['used_vit'] = False
@@ -282,7 +365,6 @@ class ModalityReliabilityEstimator(nn.Module):
         super(ModalityReliabilityEstimator, self).__init__()
         self.modal_dims = modal_dims
         
-        # 为每个模态创建可靠性评估网络
         self.reliability_nets = nn.ModuleDict()
         for modal_name, modal_dim in modal_dims.items():
             self.reliability_nets[modal_name] = nn.Sequential(
@@ -292,53 +374,33 @@ class ModalityReliabilityEstimator(nn.Module):
                 nn.Sigmoid()
             )
         
-        # 使用普通属性存储统计量（不能用register_buffer存储字典）
         self.modal_means = {}
         self.modal_stds = {}
     
     def compute_feature_quality(self, features, modal_name):
-        """
-        计算特征质量分数
-        基于：
-        1. 特征方差（随机特征通常方差较小）
-        2. 特征范数（正常特征有合理的范数）
-        3. 网络预测的可靠性
-        """
+        """计算特征质量分数"""
         if features is None:
             return torch.zeros(1, device=next(self.parameters()).device)
         
-        # 1. 计算特征统计量
-        feature_var = features.var(dim=-1, keepdim=True)  # [N, 1]
-        feature_norm = features.norm(dim=-1, keepdim=True)  # [N, 1]
+        feature_var = features.var(dim=-1, keepdim=True)
+        feature_norm = features.norm(dim=-1, keepdim=True)
         
-        # 2. 归一化特征
         features_normalized = F.normalize(features, dim=-1)
         
-        # 3. 网络预测
         if modal_name in self.reliability_nets:
-            reliability = self.reliability_nets[modal_name](features)  # [N, 1]
+            reliability = self.reliability_nets[modal_name](features)
         else:
             reliability = torch.ones(features.size(0), 1, device=features.device)
         
-        # 4. 组合多个信号
-        # 低方差的特征可能是随机填充的
-        var_score = torch.sigmoid(feature_var * 10 - 0.5)  # 方差太小则分数低
-        norm_score = torch.sigmoid(feature_norm - 0.5)  # 范数太小则分数低
+        var_score = torch.sigmoid(feature_var * 10 - 0.5)
+        norm_score = torch.sigmoid(feature_norm - 0.5)
         
         quality_score = (reliability + var_score + norm_score) / 3.0
         
         return quality_score.squeeze(-1)
     
     def forward(self, modal_features):
-        """
-        计算所有模态的可靠性分数
-        
-        Args:
-            modal_features: dict, {modal_name: features [N, D]}
-        
-        Returns:
-            reliability_scores: dict, {modal_name: scores [N]}
-        """
+        """计算所有模态的可靠性分数"""
         reliability_scores = {}
         
         for modal_name, features in modal_features.items():
@@ -354,11 +416,12 @@ class ModalityReliabilityEstimator(nn.Module):
 
 class AdaptiveMultiModalFusion(nn.Module):
     """
-    自适应多模态融合层
+    自适应多模态融合层 - 改进版
     改进点：
-    1. 实体级别的动态权重（不是全局权重）
+    1. 实体级别的动态权重
     2. 基于可靠性的加权
     3. 跨模态注意力交互
+    4. [新增] 低质量模态过滤
     """
     
     def __init__(self, modal_dims, output_dim, use_cross_modal_attention=True):
@@ -367,7 +430,6 @@ class AdaptiveMultiModalFusion(nn.Module):
         self.output_dim = output_dim
         self.use_cross_modal_attention = use_cross_modal_attention
         
-        # 标准化维度
         self.standard_dim = 128
         
         # 模态投影层
@@ -383,7 +445,7 @@ class AdaptiveMultiModalFusion(nn.Module):
         # 可靠性评估器
         self.reliability_estimator = ModalityReliabilityEstimator(modal_dims)
         
-        # 自适应门控网络（生成实体级别的模态权重）
+        # 自适应门控网络
         num_modals = len(modal_dims)
         self.gate_network = nn.Sequential(
             nn.Linear(num_modals * self.standard_dim, 128),
@@ -392,7 +454,7 @@ class AdaptiveMultiModalFusion(nn.Module):
             nn.Softmax(dim=-1)
         )
         
-        # 跨模态注意力（可选）
+        # 跨模态注意力
         if use_cross_modal_attention:
             self.cross_attention = nn.MultiheadAttention(
                 embed_dim=self.standard_dim,
@@ -412,18 +474,29 @@ class AdaptiveMultiModalFusion(nn.Module):
         for modal_name in modal_dims.keys():
             self.residual_projections[modal_name] = nn.Linear(self.standard_dim, output_dim)
     
+    def _filter_low_quality_modals(self, modal_features, threshold=0.3):
+        """
+        [新增] 过滤低质量模态
+        对于大量缺失（非零比例低）的模态，直接跳过
+        """
+        filtered = {}
+        for name, feat in modal_features.items():
+            if feat is not None:
+                # 检查非零比例
+                non_zero_ratio = (feat.abs().sum(dim=-1) > 1e-6).float().mean().item()
+                if non_zero_ratio > threshold:
+                    filtered[name] = feat
+                else:
+                    # 低质量模态，跳过
+                    pass
+        return filtered
+    
     def forward(self, modal_features, knowledge_context=None):
-        """
-        自适应融合多模态特征
-        
-        Args:
-            modal_features: dict, {modal_name: features [N, D]}
-            knowledge_context: 图结构上下文（可选）
-        
-        Returns:
-            fused_features: [N, output_dim]
-        """
+        """自适应融合多模态特征"""
         device = next(self.parameters()).device
+        
+        # [新增] 过滤低质量模态
+        modal_features = self._filter_low_quality_modals(modal_features, threshold=0.3)
         
         # 1. 投影所有模态到标准维度
         projected_features = {}
@@ -437,7 +510,6 @@ class AdaptiveMultiModalFusion(nn.Module):
                 valid_modals.append(modal_name)
         
         if not valid_modals:
-            # 没有有效模态，返回零向量
             batch_size = 1
             if knowledge_context is not None:
                 batch_size = knowledge_context.size(0)
@@ -451,30 +523,23 @@ class AdaptiveMultiModalFusion(nn.Module):
         # 2. 计算模态可靠性分数
         reliability_scores = self.reliability_estimator(modal_features)
         
-        # 3. 如果使用跨模态注意力，进行特征交互
+        # 3. 跨模态注意力
         if self.use_cross_modal_attention and len(valid_modals) > 1:
-            # 将所有模态特征堆叠为序列 [N, num_modals, D]
             modal_stack = torch.stack([projected_features[m] for m in valid_modals], dim=1)
-            
-            # 跨模态注意力
             attended, _ = self.cross_attention(modal_stack, modal_stack, modal_stack)
-            
-            # 更新投影特征
             for i, modal_name in enumerate(valid_modals):
                 projected_features[modal_name] = attended[:, i, :]
         
         # 4. 计算自适应门控权重
-        # 拼接所有投影特征
         concat_features = []
         for modal_name in self.modal_dims.keys():
             if modal_name in projected_features:
                 concat_features.append(projected_features[modal_name])
             else:
-                # 对于缺失模态，使用零向量
                 concat_features.append(torch.zeros(batch_size, self.standard_dim, device=device))
         
-        concat_features = torch.cat(concat_features, dim=-1)  # [N, num_modals * D]
-        gate_weights = self.gate_network(concat_features)  # [N, num_modals]
+        concat_features = torch.cat(concat_features, dim=-1)
+        gate_weights = self.gate_network(concat_features)
         
         # 5. 结合可靠性分数调整权重
         adjusted_weights = []
@@ -483,11 +548,11 @@ class AdaptiveMultiModalFusion(nn.Module):
                 rel_score = reliability_scores[modal_name][:batch_size]
                 adjusted_weight = gate_weights[:, i] * rel_score
             else:
-                adjusted_weight = gate_weights[:, i] * 0.1  # 缺失模态给予很小权重
+                adjusted_weight = gate_weights[:, i] * 0.1
             adjusted_weights.append(adjusted_weight)
         
-        adjusted_weights = torch.stack(adjusted_weights, dim=-1)  # [N, num_modals]
-        adjusted_weights = F.softmax(adjusted_weights, dim=-1)  # 重新归一化
+        adjusted_weights = torch.stack(adjusted_weights, dim=-1)
+        adjusted_weights = F.softmax(adjusted_weights, dim=-1)
         
         # 6. 加权融合
         weighted_features = []
@@ -498,57 +563,27 @@ class AdaptiveMultiModalFusion(nn.Module):
                 weighted = torch.zeros(batch_size, self.standard_dim, device=device)
             weighted_features.append(weighted)
         
-        # 拼接加权特征
-        fused = torch.cat(weighted_features, dim=-1)  # [N, num_modals * D]
+        fused = torch.cat(weighted_features, dim=-1)
         
         # 7. 最终投影
         output = self.output_projection(fused)
         
-        # 8. 残差连接（从最可靠的模态）
+        # 8. 残差连接
         if knowledge_context is not None and 'graph' in projected_features:
             residual = self.residual_projections['graph'](projected_features['graph'])
             output = output + 0.1 * residual
         
         return output
-    
-    def get_modal_weights(self, modal_features):
-        """获取当前的模态权重（用于分析）"""
-        device = next(self.parameters()).device
-        
-        projected_features = {}
-        for modal_name in self.modal_dims.keys():
-            if modal_name in modal_features and modal_features[modal_name] is not None:
-                feat = modal_features[modal_name].to(device)
-                projected = self.modal_projections[modal_name](feat)
-                projected_features[modal_name] = projected
-        
-        batch_size = min(feat.size(0) for feat in projected_features.values())
-        
-        concat_features = []
-        for modal_name in self.modal_dims.keys():
-            if modal_name in projected_features:
-                concat_features.append(projected_features[modal_name][:batch_size])
-            else:
-                concat_features.append(torch.zeros(batch_size, self.standard_dim, device=device))
-        
-        concat_features = torch.cat(concat_features, dim=-1)
-        gate_weights = self.gate_network(concat_features)
-        
-        return gate_weights
 
 
 class CrossModalAlignmentModule(nn.Module):
-    """
-    跨模态对齐模块
-    强制不同模态表示同一实体时的一致性
-    """
+    """跨模态对齐模块"""
     
     def __init__(self, modal_dims, align_dim=128):
         super(CrossModalAlignmentModule, self).__init__()
         self.modal_dims = modal_dims
         self.align_dim = align_dim
         
-        # 为每个模态创建对齐投影
         self.align_projections = nn.ModuleDict()
         for modal_name, modal_dim in modal_dims.items():
             self.align_projections[modal_name] = nn.Sequential(
@@ -557,14 +592,9 @@ class CrossModalAlignmentModule(nn.Module):
             )
     
     def compute_alignment_loss(self, modal_features, train_links):
-        """
-        计算跨模态对齐损失
-        
-        对于对齐的实体对(e1, e2)，它们在不同模态中的表示应该相似
-        """
+        """计算跨模态对齐损失"""
         device = next(self.parameters()).device
         
-        # 收集有效模态
         valid_modals = {k: v for k, v in modal_features.items() if v is not None}
         
         if len(valid_modals) < 2:
@@ -575,7 +605,6 @@ class CrossModalAlignmentModule(nn.Module):
         
         modal_names = list(valid_modals.keys())
         
-        # 计算每对模态之间的对齐损失
         for i in range(len(modal_names)):
             for j in range(i + 1, len(modal_names)):
                 modal_i = modal_names[i]
@@ -584,15 +613,12 @@ class CrossModalAlignmentModule(nn.Module):
                 feat_i = valid_modals[modal_i]
                 feat_j = valid_modals[modal_j]
                 
-                # 投影到对齐空间
                 proj_i = self.align_projections[modal_i](feat_i)
                 proj_j = self.align_projections[modal_j](feat_j)
                 
-                # 归一化
                 proj_i = F.normalize(proj_i, dim=-1)
                 proj_j = F.normalize(proj_j, dim=-1)
                 
-                # 确保索引有效
                 min_size = min(proj_i.size(0), proj_j.size(0))
                 valid_links = train_links[train_links[:, 0] < min_size]
                 valid_links = valid_links[valid_links[:, 1] < min_size]
@@ -600,11 +626,9 @@ class CrossModalAlignmentModule(nn.Module):
                 if len(valid_links) == 0:
                     continue
                 
-                # 对齐实体应该在不同模态中相似
                 aligned_i = proj_i[valid_links[:, 0]]
                 aligned_j = proj_j[valid_links[:, 1]]
                 
-                # 计算余弦相似度损失（鼓励相似）
                 similarity = F.cosine_similarity(aligned_i, aligned_j, dim=-1)
                 alignment_loss = 1.0 - similarity.mean()
                 
@@ -624,6 +648,8 @@ class IBMultiModal(nn.Module):
     1. 自适应多模态融合
     2. 模态可靠性评估
     3. 跨模态对齐
+    4. [新增] 可选ResidualGCN
+    5. [新增] 邻居聚合增强
     """
     
     def __init__(
@@ -654,9 +680,13 @@ class IBMultiModal(nn.Module):
         nn.init.normal_(self.entity_emb.weight, std=1.0 / math.sqrt(self.ENT_NUM))
         self.entity_emb.requires_grad = True
 
-        # 特征处理层 - 改进的投影
+        # [改进] 关系特征处理层 - 更大的网络
         self.rel_fc = nn.Sequential(
-            nn.Linear(1000, attr_dim * 2),
+            nn.Linear(1000, attr_dim * 4),
+            nn.LayerNorm(attr_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(attr_dim * 4, attr_dim * 2),
             nn.LayerNorm(attr_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -723,12 +753,19 @@ class IBMultiModal(nn.Module):
             self.att_fc_mu = nn.Linear(attr_dim, attr_dim)
             self.att_fc_std = nn.Linear(attr_dim, attr_dim)
 
-        # 图结构编码器
+        # [改进] 图结构编码器 - 支持ResidualGCN
         no_diag = getattr(args, 'no_diag', False)
         diag = not no_diag
         self._init_structure_encoder(dropout, diag)
+        
+        # [新增] 邻居聚合模块
+        self.use_neighbor_agg = getattr(args, 'use_neighbor_agg', False)
+        if self.use_neighbor_agg:
+            self.neighbor_aggregator = NeighborAggregator(
+                self.n_units[-1], self.n_units[-1]
+            )
 
-        # 多模态融合 - 使用改进的自适应融合
+        # 多模态融合
         modal_dims = {}
         if args.w_gcn: modal_dims['graph'] = self.n_units[-1]
         if args.w_img: modal_dims['image'] = img_dim
@@ -738,7 +775,6 @@ class IBMultiModal(nn.Module):
         if args.w_char: modal_dims['char'] = char_dim
         if self.use_clip: modal_dims['clip'] = img_dim
         
-        # 使用改进的自适应融合层
         joint_dim = getattr(args, 'joint_dim', 600)
         self.fusion = AdaptiveMultiModalFusion(
             modal_dims=modal_dims,
@@ -775,38 +811,64 @@ class IBMultiModal(nn.Module):
         # CLIP特征记录
         self.clip_features = {}
         
-        # 模态特征记录（用于跨模态对齐损失）
+        # 模态特征记录
         self.modal_features = {}
 
     def _init_structure_encoder(self, dropout, diag):
         """初始化图结构编码器"""
         structure_encoder = getattr(self.args, 'structure_encoder', 'gcn')
+        use_residual_gcn = getattr(self.args, 'use_residual_gcn', False)
         
         if structure_encoder == 'gcn':
-            if self.use_graph_vib:
-                # 🆕 Graph VIB: 创建mu和logvar两个网络
-                self.cross_graph_model_mu = SimpleGCN(
-                    self.input_dim, 
-                    self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
-                    self.n_units[-1], 
-                    dropout
-                )
-                self.cross_graph_model_logvar = SimpleGCN(
-                    self.input_dim, 
-                    self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
-                    self.n_units[-1], 
-                    dropout
-                )
+            if use_residual_gcn:
+                # [新增] 使用ResidualGCN
+                if self.use_graph_vib:
+                    self.cross_graph_model_mu = ResidualGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout,
+                        num_layers=len(self.n_units)
+                    )
+                    self.cross_graph_model_logvar = ResidualGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout,
+                        num_layers=len(self.n_units)
+                    )
+                else:
+                    self.cross_graph_model = ResidualGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout,
+                        num_layers=len(self.n_units)
+                    )
             else:
-                self.cross_graph_model = SimpleGCN(
-                    self.input_dim, 
-                    self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
-                    self.n_units[-1], 
-                    dropout
-                )
+                # 原始SimpleGCN
+                if self.use_graph_vib:
+                    self.cross_graph_model_mu = SimpleGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout
+                    )
+                    self.cross_graph_model_logvar = SimpleGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout
+                    )
+                else:
+                    self.cross_graph_model = SimpleGCN(
+                        self.input_dim, 
+                        self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                        self.n_units[-1], 
+                        dropout
+                    )
         elif structure_encoder == 'gat':
             if self.use_graph_vib:
-                # 🆕 GAT + VIB
                 self.cross_graph_model_mu = SimpleGAT(
                     self.n_units,
                     self.n_heads,
@@ -860,9 +922,7 @@ class IBMultiModal(nn.Module):
         char_features=None,
         entity_texts=None,
     ):
-        """
-        前向传播
-        """
+        """前向传播"""
         modal_features = {}
         
         # === 图结构特征处理 ===
@@ -872,21 +932,22 @@ class IBMultiModal(nn.Module):
                 entity_input = self.entity_emb(input_idx)
                 
                 if self.use_graph_vib and hasattr(self, 'cross_graph_model_mu'):
-                    # 🆕 Graph VIB: 使用正确的reparameterization
                     gph_mu = self.cross_graph_model_mu(entity_input, adj)
                     gph_logvar = self.cross_graph_model_logvar(entity_input, adj)
-                    # 约束logvar范围，防止数值不稳定
                     gph_logvar = torch.clamp(gph_logvar, -10, 2)
                     gph_std = torch.exp(0.5 * gph_logvar)
                     eps = torch.randn_like(gph_std)
                     gph_emb = gph_mu + eps * gph_std
-                    # 计算KLD损失
                     self.kld_loss = self._kld_gauss(
                         gph_mu, gph_std, 
                         torch.zeros_like(gph_mu), torch.ones_like(gph_std)
                     )
                 else:
                     gph_emb = self.cross_graph_model(entity_input, adj)
+                
+                # [新增] 邻居聚合增强
+                if self.use_neighbor_agg and hasattr(self, 'neighbor_aggregator'):
+                    gph_emb = gph_emb + 0.1 * self.neighbor_aggregator(gph_emb, adj)
                     
                 modal_features['graph'] = gph_emb
             except Exception as e:
@@ -1013,7 +1074,7 @@ class IBMultiModal(nn.Module):
             if 'graph' in modal_features and modal_features['graph'] is not None:
                 modal_features['graph'] = self.gph_pro(modal_features['graph'])
 
-        # 保存模态特征（用于跨模态对齐损失）
+        # 保存模态特征
         self.modal_features = modal_features
 
         # === 多模态融合 ===
@@ -1083,7 +1144,7 @@ class IBMultiModal(nn.Module):
         return torch.tensor(0.0)
 
 
-# 为了保持兼容性，设置别名
+# 兼容性别名
 KAMultiModal = IBMultiModal
 ClipEnhancedKACEA = IBMultiModal
 KACEA = IBMultiModal
