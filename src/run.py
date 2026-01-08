@@ -634,6 +634,116 @@ class KACEA:
             help="threshold for confidence weighting"
         )
         
+        # ============================================
+        # [新增] 架构改进模块参数（可配置）
+        # ============================================
+        
+        # [FB15K专用] 关系感知模块
+        parser.add_argument(
+            "--use_rgcn",
+            action="store_true",
+            default=False,
+            help="[FB15K] use Relational GCN for relation-aware graph encoding"
+        )
+        parser.add_argument(
+            "--num_relations",
+            type=int,
+            default=100,
+            help="number of relation types for R-GCN"
+        )
+        
+        # [通用] 跨KG注意力
+        parser.add_argument(
+            "--use_cross_kg_attention",
+            action="store_true",
+            default=False,
+            help="use cross-KG attention to propagate information between KGs"
+        )
+        
+        # [DBP15K专用] 对齐传播网络
+        parser.add_argument(
+            "--use_alignment_propagation",
+            action="store_true",
+            default=False,
+            help="[DBP15K] use alignment propagation network"
+        )
+        
+        # [DBP15K专用] 跨语言编码器
+        parser.add_argument(
+            "--use_cross_lingual_encoder",
+            action="store_true",
+            default=False,
+            help="[DBP15K] use multilingual BERT for cross-lingual name encoding"
+        )
+        parser.add_argument(
+            "--mbert_model",
+            type=str,
+            default="bert-base-multilingual-cased",
+            help="multilingual BERT model name"
+        )
+        parser.add_argument(
+            "--mbert_freeze",
+            action="store_true",
+            default=True,
+            help="freeze multilingual BERT parameters"
+        )
+        
+        # [FB15K专用] 图匹配网络
+        parser.add_argument(
+            "--use_graph_matching",
+            action="store_true",
+            default=False,
+            help="[FB15K] use graph matching network to compare neighborhood structures"
+        )
+        parser.add_argument(
+            "--matching_k_hop",
+            type=int,
+            default=2,
+            help="k-hop neighborhood for graph matching"
+        )
+        
+        # [DBP15K专用] 多视图一致性
+        parser.add_argument(
+            "--use_multi_view_consistency",
+            action="store_true",
+            default=False,
+            help="[DBP15K] enforce consistency across different modality views"
+        )
+        parser.add_argument(
+            "--multi_view_weight",
+            type=float,
+            default=0.3,
+            help="weight for multi-view consistency loss"
+        )
+        
+        # [通用] 动量对比学习
+        parser.add_argument(
+            "--use_momentum_contrast",
+            action="store_true",
+            default=False,
+            help="use momentum contrast (MoCo) for contrastive learning"
+        )
+        parser.add_argument(
+            "--moco_queue_size",
+            type=int,
+            default=4096,
+            help="queue size for MoCo"
+        )
+        parser.add_argument(
+            "--moco_momentum",
+            type=float,
+            default=0.999,
+            help="momentum coefficient for MoCo"
+        )
+        
+        # 图匹配损失权重
+        parser.add_argument(
+            "--graph_matching_weight",
+            type=float,
+            default=0.5,
+            help="weight for graph matching loss"
+        )
+        
         args = parser.parse_args()
         
         # 处理 no_xxx 参数覆盖 w_xxx
@@ -661,6 +771,29 @@ class KACEA:
             torch.cuda.manual_seed(seed)
 
     def print_summary(self):
+        # 收集启用的架构改进模块
+        enabled_modules = []
+        if getattr(self.args, 'use_residual_gcn', False):
+            enabled_modules.append("ResidualGCN")
+        if getattr(self.args, 'use_neighbor_agg', False):
+            enabled_modules.append("NeighborAgg")
+        if getattr(self.args, 'use_rgcn', False):
+            enabled_modules.append("R-GCN")
+        if getattr(self.args, 'use_cross_kg_attention', False):
+            enabled_modules.append("CrossKGAttn")
+        if getattr(self.args, 'use_alignment_propagation', False):
+            enabled_modules.append("AlignProp")
+        if getattr(self.args, 'use_cross_lingual_encoder', False):
+            enabled_modules.append("CrossLingual")
+        if getattr(self.args, 'use_graph_matching', False):
+            enabled_modules.append("GraphMatch")
+        if getattr(self.args, 'use_multi_view_consistency', False):
+            enabled_modules.append("MultiViewConsist")
+        if getattr(self.args, 'use_momentum_contrast', False):
+            enabled_modules.append("MoCo")
+        
+        modules_str = ", ".join(enabled_modules) if enabled_modules else "None"
+        
         summary_msg = f"""-----dataset summary-----
 dataset:\t{self.args.file_dir}
 triple num:\t{len(self.triples)}
@@ -670,8 +803,8 @@ train ill num:\t{self.train_ill.shape[0]}\ttest ill num:\t{self.test_ill.shape[0
 CLIP enabled:\t{self.args.use_clip}
 Entity names:\t{self.args.use_entity_names}
 Enhanced Rel:\t{getattr(self.args, 'use_enhanced_rel', False)}
-ResidualGCN:\t{getattr(self.args, 'use_residual_gcn', False)}
 Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
+Arch Modules:\t{modules_str}
 -------------------------"""
         self.log_print(summary_msg)
 
@@ -824,6 +957,10 @@ Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
             self.adj = torch.sparse.FloatTensor(indices, values, (self.ENT_NUM, self.ENT_NUM)).to(self.device)
 
         self.log_print("Data initialization completed successfully!")
+        
+        # [新增] 记录关系数量（用于R-GCN）
+        if not hasattr(self.args, 'num_relations'):
+            self.args.num_relations = self.REL_NUM
 
     def init_model(self):
         """初始化模型"""
@@ -876,6 +1013,11 @@ Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
             
             self.log_print("Model initialized with safe defaults")
     
+        # [新增] 设置KG划分信息（用于跨KG模块）
+        if hasattr(self, 'left_ents') and hasattr(self, 'right_ents'):
+            self.multimodal_encoder.set_kg_split(self.left_ents, self.right_ents)
+            self.log_print(f"KG split set: {len(self.left_ents)} left entities, {len(self.right_ents)} right entities")
+        
         self.params = [{"params": list(self.multimodal_encoder.parameters())}]
         total_params = sum(
             p.numel()
@@ -1022,8 +1164,15 @@ Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
             
             np.random.shuffle(self.train_ill)
             
+            # [新增] 在每个epoch开始时更新模型的train_links（用于对齐传播）
+            if hasattr(self.multimodal_encoder, 'train_links'):
+                self.multimodal_encoder.train_links = torch.from_numpy(self.train_ill).to(device)
+            else:
+                self.multimodal_encoder.train_links = torch.from_numpy(self.train_ill).to(device)
+            
             for si in np.arange(0, self.train_ill.shape[0], bsize):
                 current_links = self.train_ill[si : si + bsize]
+                current_links_tensor = torch.from_numpy(current_links).to(device)
                 
                 if getattr(self.args, 'use_comprehensive_loss', False) and self.comprehensive_loss is not None:
                     try:
@@ -1155,6 +1304,50 @@ Early Stop:\t{getattr(self.args, 'use_early_stopping', False)}
                         except Exception as e:
                             epoch_info += f" [joint_loss_failed]"
                                 
+                    # === [新增] 多视图一致性损失 ===
+                    if getattr(self.args, 'use_multi_view_consistency', False):
+                        try:
+                            multi_view_loss = self.multimodal_encoder.get_multi_view_consistency_loss(
+                                current_links_tensor
+                            )
+                            multi_view_weight = getattr(self.args, 'multi_view_weight', 0.3)
+                            weighted_mv_loss = multi_view_loss * multi_view_weight
+                            epoch_info += f" mv:{multi_view_loss:.4f}"
+                            loss_list.append(weighted_mv_loss)
+                        except Exception as e:
+                            epoch_info += f" [mv_loss_failed]"
+                    
+                    # === [新增] 图匹配损失 ===
+                    if getattr(self.args, 'use_graph_matching', False):
+                        try:
+                            # 构造正负样本对
+                            num_pos = len(current_links)
+                            num_neg = num_pos  # 负样本数量与正样本相同
+                            
+                            # 正样本
+                            pos_pairs = current_links_tensor
+                            pos_labels = torch.ones(num_pos, device=device)
+                            
+                            # 负样本（随机配对）
+                            neg_left = current_links[:, 0]
+                            neg_right = np.random.choice(self.right_ents, num_neg, replace=True)
+                            neg_pairs = torch.from_numpy(np.stack([neg_left, neg_right], axis=1)).to(device)
+                            neg_labels = torch.zeros(num_neg, device=device)
+                            
+                            # 合并
+                            all_pairs = torch.cat([pos_pairs, neg_pairs], dim=0)
+                            all_labels = torch.cat([pos_labels, neg_labels], dim=0)
+                            
+                            graph_matching_loss = self.multimodal_encoder.get_graph_matching_loss(
+                                self.adj, all_pairs, all_labels
+                            )
+                            gm_weight = getattr(self.args, 'graph_matching_weight', 0.5)
+                            weighted_gm_loss = graph_matching_loss * gm_weight
+                            epoch_info += f" gm:{graph_matching_loss:.4f}"
+                            loss_list.append(weighted_gm_loss)
+                        except Exception as e:
+                            epoch_info += f" [gm_loss_failed]"
+                    
                     # === 计算总损失 ===
                     if loss_list:
                         loss_all = sum(loss_list)

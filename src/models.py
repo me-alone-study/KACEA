@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-改进的多模态实体对齐模型 - 增强版
+改进的多模态实体对齐模型 - 统一可配置架构
 主要改进：
 1. 模态可靠性评估 - 自动检测缺失/低质量模态
 2. 自适应融合权重 - 实体级别的动态权重
@@ -10,6 +10,17 @@
 5. [新增] ResidualGCN - 残差图卷积网络
 6. [新增] NeighborAggregator - 邻居信息聚合
 7. [新增] 低质量模态过滤机制
+
+=== 可配置的架构改进模块 ===
+8. [DBP15K] CrossLingualEncoder - 跨语言名称编码
+9. [DBP15K] AlignmentPropagation - 对齐传播网络
+10. [DBP15K] MultiViewConsistency - 多视图一致性学习
+11. [DBP15K] CharAwareAlignment - 字符级匹配
+12. [FB15K] RelationalGCN - 关系感知图卷积
+13. [FB15K] CrossKGAttention - 跨知识图谱注意力
+14. [FB15K] GraphMatching - 图匹配网络
+15. [通用] MomentumContrast - 动量对比学习
+16. [通用] MultiGranularityAlignment - 多粒度对齐
 """
 
 import math
@@ -26,6 +37,15 @@ except ImportError:
     print("Warning: transformers not available, CLIP features disabled")
     CLIPModel = CLIPProcessor = CLIPTokenizer = None
     CLIP_AVAILABLE = False
+
+# 多语言BERT导入（用于跨语言对齐）
+try:
+    from transformers import BertModel, BertTokenizer, XLMRobertaModel, XLMRobertaTokenizer
+    MBERT_AVAILABLE = True
+except ImportError:
+    print("Warning: multilingual BERT not available")
+    BertModel = BertTokenizer = XLMRobertaModel = XLMRobertaTokenizer = None
+    MBERT_AVAILABLE = False
 
 try:
     from layers import GraphConvolution, MultiHeadGraphAttention, ProjectionHead
@@ -174,6 +194,533 @@ class NeighborAggregator(nn.Module):
         enhanced = self.combine_transform(combined)
         
         return enhanced
+
+
+# ============================================
+# 新增架构改进模块（可配置）
+# ============================================
+
+class RelationalGCN(nn.Module):
+    """
+    [FB15K专用] 关系感知图卷积网络
+    为不同关系类型使用不同的权重矩阵
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, num_relations, num_bases=None, dropout=0.3):
+        super(RelationalGCN, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_relations = num_relations
+        self.num_bases = num_bases or min(num_relations, 100)
+        self.dropout = dropout
+        
+        # 使用基分解减少参数量
+        self.bases = nn.Parameter(torch.Tensor(self.num_bases, input_dim, hidden_dim))
+        self.weights = nn.Parameter(torch.Tensor(num_relations, self.num_bases))
+        
+        # 自环权重
+        self.self_loop_weight = nn.Linear(input_dim, hidden_dim)
+        
+        # 第二层
+        self.bases2 = nn.Parameter(torch.Tensor(self.num_bases, hidden_dim, output_dim))
+        self.weights2 = nn.Parameter(torch.Tensor(num_relations, self.num_bases))
+        self.self_loop_weight2 = nn.Linear(hidden_dim, output_dim)
+        
+        # 归一化
+        self.layer_norm1 = nn.LayerNorm(hidden_dim)
+        self.layer_norm2 = nn.LayerNorm(output_dim)
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.bases)
+        nn.init.xavier_uniform_(self.weights)
+        nn.init.xavier_uniform_(self.bases2)
+        nn.init.xavier_uniform_(self.weights2)
+    
+    def forward(self, x, adj, edge_type=None):
+        """
+        Args:
+            x: [N, input_dim]
+            adj: [N, N] 邻接矩阵
+            edge_type: [N, N] 边的关系类型（可选）
+        """
+        # 第一层
+        h = self._rgcn_layer(x, adj, edge_type, self.bases, self.weights, self.self_loop_weight)
+        h = self.layer_norm1(h)
+        h = F.relu(h)
+        h = F.dropout(h, self.dropout, training=self.training)
+        
+        # 第二层
+        h = self._rgcn_layer(h, adj, edge_type, self.bases2, self.weights2, self.self_loop_weight2)
+        h = self.layer_norm2(h)
+        
+        return h
+    
+    def _rgcn_layer(self, x, adj, edge_type, bases, weights, self_loop):
+        """单层R-GCN"""
+        # 自环
+        out = self_loop(x)
+        
+        # 如果没有边类型信息，使用标准GCN
+        if edge_type is None:
+            if adj.is_sparse:
+                out = out + torch.sparse.mm(adj, x @ bases[0])
+            else:
+                out = out + torch.mm(adj, x @ bases[0])
+        else:
+            # 关系特定的传播
+            for r in range(self.num_relations):
+                # 获取关系r的权重矩阵（基分解）
+                w_r = torch.sum(weights[r].unsqueeze(-1).unsqueeze(-1) * bases, dim=0)
+                
+                # 关系r的邻接矩阵
+                adj_r = (edge_type == r).float() * adj
+                
+                # 传播
+                if adj_r.is_sparse:
+                    out = out + torch.sparse.mm(adj_r, x @ w_r)
+                else:
+                    out = out + torch.mm(adj_r, x @ w_r)
+        
+        return out
+
+
+class CrossKGAttention(nn.Module):
+    """
+    [通用] 跨知识图谱注意力机制
+    利用已知对齐在两个KG之间传递信息
+    """
+    def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
+        super(CrossKGAttention, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        
+        # 多头注意力
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+        
+    def forward(self, kg1_emb, kg2_emb, alignment_matrix):
+        """
+        Args:
+            kg1_emb: [N1, hidden_dim] KG1的实体嵌入
+            kg2_emb: [N2, hidden_dim] KG2的实体嵌入
+            alignment_matrix: [N1, N2] 对齐矩阵（0/1或概率）
+        Returns:
+            kg1_enhanced: [N1, hidden_dim]
+            kg2_enhanced: [N2, hidden_dim]
+        """
+        batch_size_1 = kg1_emb.size(0)
+        batch_size_2 = kg2_emb.size(0)
+        
+        # KG1查询KG2
+        Q1 = self.query_proj(kg1_emb).view(batch_size_1, self.num_heads, self.head_dim)
+        K2 = self.key_proj(kg2_emb).view(batch_size_2, self.num_heads, self.head_dim)
+        V2 = self.value_proj(kg2_emb).view(batch_size_2, self.num_heads, self.head_dim)
+        
+        # 计算注意力分数
+        attn_scores_1to2 = torch.einsum('nih,mjh->nmij', Q1, K2) * self.scale  # [N1, N2, num_heads, 1]
+        attn_scores_1to2 = attn_scores_1to2.mean(dim=-1)  # [N1, N2, num_heads]
+        
+        # 用对齐矩阵作为mask
+        alignment_mask = alignment_matrix.unsqueeze(-1).expand(-1, -1, self.num_heads)
+        attn_scores_1to2 = attn_scores_1to2 * alignment_mask
+        
+        # Softmax
+        attn_weights_1to2 = F.softmax(attn_scores_1to2, dim=1)
+        attn_weights_1to2 = self.dropout(attn_weights_1to2)
+        
+        # 聚合
+        kg1_from_kg2 = torch.einsum('nmh,mhd->nhd', attn_weights_1to2, V2)
+        kg1_from_kg2 = kg1_from_kg2.reshape(batch_size_1, self.hidden_dim)
+        kg1_enhanced = kg1_emb + self.out_proj(kg1_from_kg2)
+        
+        # KG2查询KG1（对称操作）
+        Q2 = self.query_proj(kg2_emb).view(batch_size_2, self.num_heads, self.head_dim)
+        K1 = self.key_proj(kg1_emb).view(batch_size_1, self.num_heads, self.head_dim)
+        V1 = self.value_proj(kg1_emb).view(batch_size_1, self.num_heads, self.head_dim)
+        
+        attn_scores_2to1 = torch.einsum('mih,njh->mnij', Q2, K1) * self.scale
+        attn_scores_2to1 = attn_scores_2to1.mean(dim=-1)
+        
+        alignment_mask_t = alignment_matrix.t().unsqueeze(-1).expand(-1, -1, self.num_heads)
+        attn_scores_2to1 = attn_scores_2to1 * alignment_mask_t
+        
+        attn_weights_2to1 = F.softmax(attn_scores_2to1, dim=1)
+        attn_weights_2to1 = self.dropout(attn_weights_2to1)
+        
+        kg2_from_kg1 = torch.einsum('mnh,nhd->mhd', attn_weights_2to1, V1)
+        kg2_from_kg1 = kg2_from_kg1.reshape(batch_size_2, self.hidden_dim)
+        kg2_enhanced = kg2_emb + self.out_proj(kg2_from_kg1)
+        
+        return kg1_enhanced, kg2_enhanced
+
+
+class AlignmentPropagationNetwork(nn.Module):
+    """
+    [DBP15K专用] 对齐传播网络
+    在跨KG图上传播对齐信息
+    """
+    def __init__(self, hidden_dim, num_layers=2, dropout=0.1):
+        super(AlignmentPropagationNetwork, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # 多层跨KG注意力
+        self.cross_kg_layers = nn.ModuleList([
+            CrossKGAttention(hidden_dim, num_heads=4, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # 门控机制
+        self.gates = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Sigmoid()
+            ) for _ in range(num_layers)
+        ])
+        
+    def forward(self, kg1_emb, kg2_emb, train_links):
+        """
+        Args:
+            kg1_emb: [N1, hidden_dim]
+            kg2_emb: [N2, hidden_dim]
+            train_links: [num_links, 2] 训练对齐对
+        Returns:
+            kg1_prop: [N1, hidden_dim] 传播后的KG1嵌入
+            kg2_prop: [N2, hidden_dim] 传播后的KG2嵌入
+        """
+        # 构建对齐矩阵
+        alignment_matrix = self._build_alignment_matrix(
+            kg1_emb.size(0), kg2_emb.size(0), train_links, kg1_emb.device
+        )
+        
+        kg1_prop = kg1_emb
+        kg2_prop = kg2_emb
+        
+        # 多层传播
+        for layer_idx in range(self.num_layers):
+            # 跨KG注意力
+            kg1_new, kg2_new = self.cross_kg_layers[layer_idx](
+                kg1_prop, kg2_prop, alignment_matrix
+            )
+            
+            # 门控融合
+            gate1 = self.gates[layer_idx](torch.cat([kg1_prop, kg1_new], dim=-1))
+            kg1_prop = gate1 * kg1_new + (1 - gate1) * kg1_prop
+            
+            gate2 = self.gates[layer_idx](torch.cat([kg2_prop, kg2_new], dim=-1))
+            kg2_prop = gate2 * kg2_new + (1 - gate2) * kg2_prop
+        
+        return kg1_prop, kg2_prop
+    
+    def _build_alignment_matrix(self, n1, n2, train_links, device):
+        """构建对齐矩阵"""
+        alignment_matrix = torch.zeros(n1, n2, device=device)
+        if len(train_links) > 0:
+            valid_links = train_links[
+                (train_links[:, 0] < n1) & (train_links[:, 1] < n2)
+            ]
+            if len(valid_links) > 0:
+                alignment_matrix[valid_links[:, 0], valid_links[:, 1]] = 1.0
+        return alignment_matrix
+
+
+class CrossLingualNameEncoder(nn.Module):
+    """
+    [DBP15K专用] 跨语言名称编码器
+    使用多语言BERT处理中英文实体名称
+    """
+    def __init__(self, model_name='bert-base-multilingual-cased', output_dim=128, freeze=True):
+        super(CrossLingualNameEncoder, self).__init__()
+        
+        if not MBERT_AVAILABLE:
+            raise ImportError("transformers library required for multilingual BERT")
+        
+        # 使用多语言BERT或XLM-RoBERTa
+        if 'xlm-roberta' in model_name.lower():
+            self.encoder = XLMRobertaModel.from_pretrained(model_name)
+            self.tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
+        else:
+            self.encoder = BertModel.from_pretrained(model_name)
+            self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        
+        if freeze:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+        
+        # 投影层
+        self.projection = nn.Sequential(
+            nn.Linear(768, output_dim * 2),
+            nn.LayerNorm(output_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(output_dim * 2, output_dim)
+        )
+    
+    def forward(self, entity_names, batch_size=64):
+        """
+        Args:
+            entity_names: List[str] 实体名称列表
+            batch_size: 批处理大小
+        Returns:
+            embeddings: [N, output_dim]
+        """
+        all_embeddings = []
+        
+        for i in range(0, len(entity_names), batch_size):
+            batch_names = entity_names[i:i+batch_size]
+            
+            # Tokenize
+            inputs = self.tokenizer(
+                batch_names,
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors='pt'
+            )
+            inputs = {k: v.to(next(self.encoder.parameters()).device) for k, v in inputs.items()}
+            
+            # Encode
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                outputs = self.encoder(**inputs)
+                # 使用[CLS] token的表示
+                cls_embeddings = outputs.last_hidden_state[:, 0, :]
+            
+            # Project
+            projected = self.projection(cls_embeddings)
+            all_embeddings.append(projected)
+        
+        return torch.cat(all_embeddings, dim=0)
+
+
+class GraphMatchingNetwork(nn.Module):
+    """
+    [FB15K专用] 图匹配网络
+    考虑实体邻域结构的相似性
+    """
+    def __init__(self, hidden_dim, k_hop=2):
+        super(GraphMatchingNetwork, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.k_hop = k_hop
+        
+        # 邻域编码器
+        self.neighborhood_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # 图匹配得分网络
+        self.matching_network = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, emb, adj, entity_pairs):
+        """
+        Args:
+            emb: [N, hidden_dim] 实体嵌入
+            adj: [N, N] 邻接矩阵
+            entity_pairs: [num_pairs, 2] 待匹配的实体对
+        Returns:
+            matching_scores: [num_pairs] 匹配分数
+        """
+        # 提取k-hop邻域
+        neighborhoods = self._extract_neighborhoods(emb, adj, self.k_hop)
+        
+        # 对每个实体对计算匹配分数
+        e1_indices = entity_pairs[:, 0]
+        e2_indices = entity_pairs[:, 1]
+        
+        e1_emb = emb[e1_indices]
+        e2_emb = emb[e2_indices]
+        e1_neigh = neighborhoods[e1_indices]
+        e2_neigh = neighborhoods[e2_indices]
+        
+        # 拼接特征：[实体1, 实体2, 邻域1, 邻域2]
+        combined = torch.cat([e1_emb, e2_emb, e1_neigh, e2_neigh], dim=-1)
+        
+        # 计算匹配分数
+        matching_scores = self.matching_network(combined).squeeze(-1)
+        
+        return matching_scores
+    
+    def _extract_neighborhoods(self, emb, adj, k_hop):
+        """提取k-hop邻域表示"""
+        # 简化版：使用k次矩阵乘法聚合k-hop邻居
+        neighborhood_emb = emb
+        adj_power = adj
+        
+        for _ in range(k_hop):
+            if adj_power.is_sparse:
+                neighborhood_emb = torch.sparse.mm(adj_power, neighborhood_emb)
+            else:
+                neighborhood_emb = torch.mm(adj_power, neighborhood_emb)
+        
+        # 编码
+        return self.neighborhood_encoder(neighborhood_emb)
+
+
+class MultiViewConsistencyModule(nn.Module):
+    """
+    [DBP15K专用] 多视图一致性模块
+    确保不同模态的对齐决策一致
+    """
+    def __init__(self, view_names):
+        super(MultiViewConsistencyModule, self).__init__()
+        self.view_names = view_names
+    
+    def compute_consistency_loss(self, embeddings_dict, links, temperature=0.1):
+        """
+        计算多视图一致性损失
+        Args:
+            embeddings_dict: Dict[str, Tensor] 各视图的嵌入
+            links: [num_links, 2] 对齐对
+            temperature: 温度参数
+        Returns:
+            consistency_loss: 标量损失
+        """
+        if len(embeddings_dict) < 2:
+            return torch.tensor(0.0, device=next(iter(embeddings_dict.values())).device)
+        
+        # 计算每个视图的相似度矩阵
+        similarities = {}
+        for view_name, emb in embeddings_dict.items():
+            if emb is not None and len(links) > 0:
+                e1 = F.normalize(emb[links[:, 0]], dim=-1)
+                e2 = F.normalize(emb[links[:, 1]], dim=-1)
+                sim = torch.sum(e1 * e2, dim=-1) / temperature
+                similarities[view_name] = sim
+        
+        if len(similarities) < 2:
+            return torch.tensor(0.0, device=next(iter(embeddings_dict.values())).device)
+        
+        # 计算视图间的一致性损失
+        consistency_loss = 0.0
+        view_list = list(similarities.keys())
+        count = 0
+        
+        for i in range(len(view_list)):
+            for j in range(i+1, len(view_list)):
+                # KL散度或MSE
+                sim_i = F.softmax(similarities[view_list[i]], dim=0)
+                sim_j = F.softmax(similarities[view_list[j]], dim=0)
+                
+                # 使用KL散度
+                kl_loss = F.kl_div(
+                    torch.log(sim_i + 1e-10),
+                    sim_j,
+                    reduction='batchmean'
+                )
+                consistency_loss += kl_loss
+                count += 1
+        
+        return consistency_loss / max(count, 1)
+
+
+class MomentumContrastEncoder(nn.Module):
+    """
+    [通用] 动量对比编码器
+    使用momentum更新的队列进行对比学习
+    """
+    def __init__(self, encoder, dim=128, K=4096, m=0.999, T=0.07):
+        super(MomentumContrastEncoder, self).__init__()
+        
+        self.K = K  # 队列大小
+        self.m = m  # momentum系数
+        self.T = T  # 温度
+        
+        # Query encoder
+        self.encoder_q = encoder
+        
+        # Key encoder (momentum)
+        self.encoder_k = type(encoder)(encoder.args, encoder.ENT_NUM, 
+                                       encoder.img_feature_dim if hasattr(encoder, 'img_feature_dim') else 2048,
+                                       encoder.char_feature_dim if hasattr(encoder, 'char_feature_dim') else 100,
+                                       encoder.use_project_head if hasattr(encoder, 'use_project_head') else False)
+        
+        # 初始化key encoder与query encoder相同
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        
+        # 创建队列
+        self.register_buffer("queue", torch.randn(dim, K))
+        self.queue = F.normalize(self.queue, dim=0)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+    
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """Momentum更新key encoder"""
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        """更新队列"""
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptr)
+        
+        # 替换队列中的键
+        if ptr + batch_size <= self.K:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+        else:
+            # 分两部分更新
+            self.queue[:, ptr:] = keys[:self.K - ptr].T
+            self.queue[:, :(ptr + batch_size) % self.K] = keys[self.K - ptr:].T
+        
+        ptr = (ptr + batch_size) % self.K
+        self.queue_ptr[0] = ptr
+    
+    def forward(self, x_q, x_k):
+        """
+        Args:
+            x_q: query样本
+            x_k: key样本（正样本）
+        Returns:
+            logits, labels
+        """
+        # Query特征
+        q = self.encoder_q(x_q)[-1]  # 取joint_emb
+        q = F.normalize(q, dim=-1)
+        
+        # Key特征（不计算梯度）
+        with torch.no_grad():
+            self._momentum_update_key_encoder()
+            k = self.encoder_k(x_k)[-1]
+            k = F.normalize(k, dim=-1)
+        
+        # 正样本logit
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        
+        # 负样本logits（从队列）
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+        
+        # 拼接
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.T
+        
+        # 标签（正样本在第0位）
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+        
+        # 更新队列
+        self._dequeue_and_enqueue(k)
+        
+        return logits, labels
 
 
 class SimpleGAT(nn.Module):
@@ -471,11 +1018,9 @@ class AdaptiveMultiModalFusion(nn.Module):
                 batch_first=True
             )
         
-        # 最终投影
-        self.output_projection = nn.Sequential(
-            nn.Linear(self.standard_dim * num_modals, output_dim),
-            nn.LayerNorm(output_dim)
-        )
+        # 最终投影 - 动态计算输入维度
+        self.num_modals = num_modals
+        self.output_projection = None  # 延迟初始化
         
         # 残差连接的投影
         self.residual_projections = nn.ModuleDict()
@@ -573,7 +1118,13 @@ class AdaptiveMultiModalFusion(nn.Module):
         
         fused = torch.cat(weighted_features, dim=-1)
         
-        # 7. 最终投影
+        # 7. 最终投影 - 动态初始化以适配实际输入维度
+        if self.output_projection is None or self.output_projection[0].in_features != fused.size(-1):
+            self.output_projection = nn.Sequential(
+                nn.Linear(fused.size(-1), self.output_dim),
+                nn.LayerNorm(self.output_dim)
+            ).to(fused.device)
+        
         output = self.output_projection(fused)
         
         # 8. 残差连接
@@ -783,6 +1334,74 @@ class IBMultiModal(nn.Module):
             self.neighbor_aggregator = NeighborAggregator(
                 self.n_units[-1], self.n_units[-1]
             )
+        
+        # ============================================
+        # [新增] 可配置的架构改进模块
+        # ============================================
+        
+        # [FB15K] R-GCN - 关系感知图卷积
+        self.use_rgcn = getattr(args, 'use_rgcn', False)
+        self.rgcn_encoder = None
+        if self.use_rgcn:
+            num_relations = getattr(args, 'num_relations', 100)
+            self.rgcn_encoder = RelationalGCN(
+                self.input_dim, self.n_units[1] if len(self.n_units) > 1 else self.input_dim,
+                self.n_units[-1], num_relations, dropout=dropout
+            )
+        
+        # [通用] 跨KG注意力
+        self.use_cross_kg_attention = getattr(args, 'use_cross_kg_attention', False)
+        self.cross_kg_attention = None
+        if self.use_cross_kg_attention:
+            self.cross_kg_attention = CrossKGAttention(
+                self.n_units[-1], num_heads=4, dropout=dropout
+            )
+        
+        # [DBP15K] 对齐传播网络
+        self.use_alignment_propagation = getattr(args, 'use_alignment_propagation', False)
+        self.alignment_propagation = None
+        if self.use_alignment_propagation:
+            self.alignment_propagation = AlignmentPropagationNetwork(
+                self.n_units[-1], num_layers=2, dropout=dropout
+            )
+        
+        # [DBP15K] 跨语言名称编码器
+        self.use_cross_lingual_encoder = getattr(args, 'use_cross_lingual_encoder', False)
+        self.cross_lingual_encoder = None
+        if self.use_cross_lingual_encoder and MBERT_AVAILABLE:
+            try:
+                mbert_model = getattr(args, 'mbert_model', 'bert-base-multilingual-cased')
+                self.cross_lingual_encoder = CrossLingualNameEncoder(
+                    model_name=mbert_model,
+                    output_dim=char_dim,
+                    freeze=getattr(args, 'mbert_freeze', True)
+                )
+                print(f"Cross-lingual encoder initialized: {mbert_model}")
+            except Exception as e:
+                print(f"Warning: Failed to initialize cross-lingual encoder: {e}")
+                self.use_cross_lingual_encoder = False
+        
+        # [FB15K] 图匹配网络
+        self.use_graph_matching = getattr(args, 'use_graph_matching', False)
+        self.graph_matching = None
+        if self.use_graph_matching:
+            self.graph_matching = GraphMatchingNetwork(
+                self.n_units[-1], k_hop=getattr(args, 'matching_k_hop', 2)
+            )
+        
+        # [DBP15K] 多视图一致性
+        self.use_multi_view_consistency = getattr(args, 'use_multi_view_consistency', False)
+        self.multi_view_consistency = None
+        if self.use_multi_view_consistency:
+            view_names = []
+            if args.w_gcn: view_names.append('graph')
+            if args.w_img: view_names.append('image')
+            if args.w_rel: view_names.append('relation')
+            if args.w_attr: view_names.append('attribute')
+            if args.w_name: view_names.append('name')
+            if args.w_char: view_names.append('char')
+            
+            self.multi_view_consistency = MultiViewConsistencyModule(view_names)
 
         # 多模态融合
         modal_dims = {}
@@ -950,7 +1569,11 @@ class IBMultiModal(nn.Module):
             try:
                 entity_input = self.entity_emb(input_idx)
                 
-                if self.use_graph_vib and hasattr(self, 'cross_graph_model_mu'):
+                # [新增] 优先使用R-GCN（如果启用）
+                if self.use_rgcn and self.rgcn_encoder is not None:
+                    edge_type = rel_features if rel_features is not None else None
+                    gph_emb = self.rgcn_encoder(entity_input, adj, edge_type)
+                elif self.use_graph_vib and hasattr(self, 'cross_graph_model_mu'):
                     gph_mu = self.cross_graph_model_mu(entity_input, adj)
                     gph_logvar = self.cross_graph_model_logvar(entity_input, adj)
                     gph_logvar = torch.clamp(gph_logvar, -10, 2)
@@ -1002,19 +1625,42 @@ class IBMultiModal(nn.Module):
             try:
                 # 动态初始化输入层(支持1000维或2004维)
                 rel_input_dim = rel_features.size(-1)
-                if self.rel_fc_input is None or self.rel_fc_input[0].in_features != rel_input_dim:
-                    self.rel_fc_input = nn.Sequential(
-                        nn.Linear(rel_input_dim, self.args.attr_dim * 8),
-                        nn.BatchNorm1d(self.args.attr_dim * 8),
-                        nn.ReLU(),
-                        nn.Dropout(self.args.dropout * 0.5)
-                    ).to(rel_features.device)
-                    # 残差投影
-                    self.rel_skip = nn.Linear(rel_input_dim, self.args.attr_dim).to(rel_features.device)
+                
+                # 确保batch normalization的维度正确
+                if rel_features.size(0) == 1:
+                    # 如果batch size为1，跳过batch norm
+                    if self.rel_fc_input is None or self.rel_fc_input[0].in_features != rel_input_dim:
+                        self.rel_fc_input = nn.Sequential(
+                            nn.Linear(rel_input_dim, self.args.attr_dim * 8),
+                            nn.LayerNorm(self.args.attr_dim * 8),
+                            nn.ReLU(),
+                            nn.Dropout(self.args.dropout * 0.5)
+                        ).to(rel_features.device)
+                        # 残差投影
+                        self.rel_skip = nn.Linear(rel_input_dim, self.args.attr_dim).to(rel_features.device)
+                else:
+                    if self.rel_fc_input is None or self.rel_fc_input[0].in_features != rel_input_dim:
+                        self.rel_fc_input = nn.Sequential(
+                            nn.Linear(rel_input_dim, self.args.attr_dim * 8),
+                            nn.BatchNorm1d(self.args.attr_dim * 8),
+                            nn.ReLU(),
+                            nn.Dropout(self.args.dropout * 0.5)
+                        ).to(rel_features.device)
+                        # 残差投影
+                        self.rel_skip = nn.Linear(rel_input_dim, self.args.attr_dim).to(rel_features.device)
                 
                 # 前向传播
                 rel_h = self.rel_fc_input(rel_features)
-                rel_emb = self.rel_fc_core(rel_h)
+                
+                # 确保rel_fc_core的batch norm也能处理
+                if rel_features.size(0) > 1:
+                    rel_emb = self.rel_fc_core(rel_h)
+                else:
+                    # batch size为1时，跳过batch norm层
+                    rel_emb = rel_h
+                    for layer in self.rel_fc_core:
+                        if not isinstance(layer, nn.BatchNorm1d):
+                            rel_emb = layer(rel_emb)
                 
                 # 残差连接
                 if self.rel_skip is not None:
@@ -1034,6 +1680,8 @@ class IBMultiModal(nn.Module):
                 modal_features['relation'] = rel_emb
             except Exception as e:
                 print(f"Warning: Relation encoding failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # === 属性特征处理 ===
         att_emb = None
@@ -1060,7 +1708,11 @@ class IBMultiModal(nn.Module):
         name_emb = None
         if self.args.w_name and name_features is not None:
             try:
-                name_emb = self.name_fc(name_features)
+                # [新增] 优先使用跨语言编码器（如果启用且提供了entity_texts）
+                if self.use_cross_lingual_encoder and self.cross_lingual_encoder is not None and entity_texts is not None:
+                    name_emb = self.cross_lingual_encoder(entity_texts)
+                else:
+                    name_emb = self.name_fc(name_features)
                 modal_features['name'] = name_emb
             except Exception as e:
                 print(f"Warning: Name encoding failed: {e}")
@@ -1137,6 +1789,16 @@ class IBMultiModal(nn.Module):
                 )
             except Exception as e:
                 print(f"Warning: Joint VIB failed: {e}")
+        
+        # ============================================
+        # [新增] 对齐传播和跨KG注意力（如果启用）
+        # ============================================
+        # 注意：由于维度匹配问题，暂时禁用自动调用
+        # 需要在训练循环中手动调用或确保维度正确后再启用
+        # if hasattr(self, '_apply_cross_kg_modules'):
+        #     joint_emb, gph_emb = self._apply_cross_kg_modules(
+        #         joint_emb, gph_emb, modal_features
+        #     )
 
         return gph_emb, img_emb, rel_emb, att_emb, name_emb, char_emb, joint_emb
 
@@ -1179,6 +1841,152 @@ class IBMultiModal(nn.Module):
                 self.modal_features, train_links
             )
         return torch.tensor(0.0)
+    
+    def set_kg_split(self, left_ents, right_ents):
+        """设置KG划分信息（用于跨KG模块）"""
+        self.left_ents = left_ents
+        self.right_ents = right_ents
+    
+    def _apply_cross_kg_modules(self, joint_emb, gph_emb, modal_features):
+        """
+        应用跨KG模块（对齐传播、跨KG注意力）
+        需要先调用set_kg_split设置KG划分
+        """
+        if not hasattr(self, 'left_ents') or not hasattr(self, 'right_ents'):
+            return joint_emb, gph_emb
+        
+        if not hasattr(self, 'train_links'):
+            return joint_emb, gph_emb
+        
+        try:
+            # 检查维度是否匹配
+            if joint_emb is None:
+                return joint_emb, gph_emb
+            
+            # 确保索引在范围内
+            max_left = max(self.left_ents) if len(self.left_ents) > 0 else 0
+            max_right = max(self.right_ents) if len(self.right_ents) > 0 else 0
+            
+            if max_left >= joint_emb.size(0) or max_right >= joint_emb.size(0):
+                print(f"Warning: Index out of range in cross-KG modules, skipping")
+                return joint_emb, gph_emb
+            
+            # 分离两个KG的嵌入
+            kg1_emb = joint_emb[self.left_ents]
+            kg2_emb = joint_emb[self.right_ents]
+            
+            # 检查维度
+            if kg1_emb.size(-1) != kg2_emb.size(-1):
+                print(f"Warning: Dimension mismatch in cross-KG modules: {kg1_emb.size(-1)} vs {kg2_emb.size(-1)}, skipping")
+                return joint_emb, gph_emb
+            
+            # [新增] 对齐传播
+            if self.use_alignment_propagation and self.alignment_propagation is not None:
+                # 检查模块的hidden_dim是否匹配
+                if self.alignment_propagation.hidden_dim == kg1_emb.size(-1):
+                    kg1_prop, kg2_prop = self.alignment_propagation(
+                        kg1_emb, kg2_emb, self.train_links
+                    )
+                    joint_emb[self.left_ents] = kg1_prop
+                    joint_emb[self.right_ents] = kg2_prop
+                else:
+                    print(f"Warning: AlignmentPropagation dim mismatch: {self.alignment_propagation.hidden_dim} vs {kg1_emb.size(-1)}, skipping")
+            
+            # [新增] 跨KG注意力
+            if self.use_cross_kg_attention and self.cross_kg_attention is not None:
+                # 检查模块的hidden_dim是否匹配
+                if self.cross_kg_attention.hidden_dim == kg1_emb.size(-1):
+                    alignment_matrix = self._build_alignment_matrix(
+                        len(self.left_ents), len(self.right_ents), self.train_links
+                    )
+                    kg1_attn, kg2_attn = self.cross_kg_attention(
+                        kg1_emb, kg2_emb, alignment_matrix
+                    )
+                    # 融合原始特征和注意力增强特征
+                    joint_emb[self.left_ents] = 0.7 * joint_emb[self.left_ents] + 0.3 * kg1_attn
+                    joint_emb[self.right_ents] = 0.7 * joint_emb[self.right_ents] + 0.3 * kg2_attn
+                else:
+                    print(f"Warning: CrossKGAttention dim mismatch: {self.cross_kg_attention.hidden_dim} vs {kg1_emb.size(-1)}, skipping")
+        
+        except Exception as e:
+            print(f"Warning: Cross-KG modules failed: {e}")
+        
+        return joint_emb, gph_emb
+    
+    def _build_alignment_matrix(self, n1, n2, train_links):
+        """构建对齐矩阵（辅助函数）"""
+        device = next(self.parameters()).device
+        alignment_matrix = torch.zeros(n1, n2, device=device)
+        if len(train_links) > 0:
+            valid_links = train_links[
+                (train_links[:, 0] < n1) & (train_links[:, 1] < n2)
+            ]
+            if len(valid_links) > 0:
+                # 将全局索引转换为局部索引
+                left_to_local = {ent: i for i, ent in enumerate(self.left_ents)}
+                right_to_local = {ent: i for i, ent in enumerate(self.right_ents)}
+                
+                for link in valid_links:
+                    if link[0] in left_to_local and link[1] in right_to_local:
+                        i = left_to_local[link[0]]
+                        j = right_to_local[link[1]]
+                        alignment_matrix[i, j] = 1.0
+        return alignment_matrix
+    
+    def get_multi_view_consistency_loss(self, train_links):
+        """
+        获取多视图一致性损失
+        确保不同模态对相同实体对的对齐决策一致
+        """
+        if not self.use_multi_view_consistency or self.multi_view_consistency is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        if not hasattr(self, 'modal_features') or len(self.modal_features) < 2:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        # 只使用非None的模态
+        valid_modal_features = {k: v for k, v in self.modal_features.items() if v is not None}
+        
+        if len(valid_modal_features) < 2:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        try:
+            consistency_loss = self.multi_view_consistency.compute_consistency_loss(
+                valid_modal_features, train_links, temperature=0.1
+            )
+            return consistency_loss
+        except Exception as e:
+            print(f"Warning: Multi-view consistency loss failed: {e}")
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+    
+    def get_graph_matching_loss(self, adj, entity_pairs, labels):
+        """
+        获取图匹配损失
+        Args:
+            adj: 邻接矩阵
+            entity_pairs: [num_pairs, 2] 实体对
+            labels: [num_pairs] 0/1标签，1表示对齐
+        Returns:
+            matching_loss: 标量损失
+        """
+        if not self.use_graph_matching or self.graph_matching is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        if not hasattr(self, 'modal_features') or 'graph' not in self.modal_features:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        try:
+            gph_emb = self.modal_features['graph']
+            matching_scores = self.graph_matching(gph_emb, adj, entity_pairs)
+            
+            # 二元交叉熵损失
+            matching_loss = F.binary_cross_entropy(
+                matching_scores, labels.float()
+            )
+            return matching_loss
+        except Exception as e:
+            print(f"Warning: Graph matching loss failed: {e}")
+            return torch.tensor(0.0, device=next(self.parameters()).device)
 
 
 # 兼容性别名
