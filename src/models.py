@@ -52,28 +52,33 @@ class ResidualGCN(nn.Module):
     """
     [新增] 带残差连接的GCN - 更深的网络结构
     改进点：
-    1. 增加网络深度（3层）
+    1. 增加网络深度（4层）
     2. 添加残差连接防止梯度消失
-    3. 层归一化稳定训练
+    3. 批归一化+层归一化稳定训练
+    4. Dropout增强正则化
     """
-    def __init__(self, nfeat, nhid, nclass, dropout, num_layers=3):
+    def __init__(self, nfeat, nhid, nclass, dropout, num_layers=4):
         super(ResidualGCN, self).__init__()
         self.num_layers = num_layers
         self.dropout = dropout
         
         # 输入层
         self.gc_input = GraphConvolution(nfeat, nhid)
+        self.bn_input = nn.BatchNorm1d(nhid)
         self.ln_input = nn.LayerNorm(nhid)
         
         # 中间层（带残差）
         self.gc_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         for i in range(num_layers - 2):
             self.gc_layers.append(GraphConvolution(nhid, nhid))
+            self.bn_layers.append(nn.BatchNorm1d(nhid))
             self.ln_layers.append(nn.LayerNorm(nhid))
         
         # 输出层
         self.gc_output = GraphConvolution(nhid, nclass)
+        self.bn_output = nn.BatchNorm1d(nclass)
         self.ln_output = nn.LayerNorm(nclass)
         
         # 残差投影（如果维度不匹配）
@@ -86,28 +91,31 @@ class ResidualGCN(nn.Module):
         
         # 输入层
         x = self.gc_input(x, adj)
+        x = self.bn_input(x) if x.size(0) > 1 else x
         x = self.ln_input(x)
         x = F.relu(x)
         x = F.dropout(x, self.dropout, training=self.training)
         
         # 中间层（带残差）
-        for gc, ln in zip(self.gc_layers, self.ln_layers):
+        for gc, bn, ln in zip(self.gc_layers, self.bn_layers, self.ln_layers):
             residual = x
             x = gc(x, adj)
+            x = bn(x) if x.size(0) > 1 else x  # BatchNorm需要batch_size > 1
             x = ln(x)
             x = F.relu(x)
             x = F.dropout(x, self.dropout, training=self.training)
-            x = x + residual  # 残差连接
+            x = x + 0.8 * residual  # 强化残差连接
         
         # 输出层
         x = self.gc_output(x, adj)
+        x = self.bn_output(x) if x.size(0) > 1 else x
         x = self.ln_output(x)
         
         # 全局残差连接
         if self.skip_connection is not None:
             identity = self.skip_connection(identity)
         
-        return x + 0.1 * identity  # 加权残差
+        return x + 0.2 * identity  # 加权残差
 
 
 class NeighborAggregator(nn.Module):
@@ -680,18 +688,29 @@ class IBMultiModal(nn.Module):
         nn.init.normal_(self.entity_emb.weight, std=1.0 / math.sqrt(self.ENT_NUM))
         self.entity_emb.requires_grad = True
 
-        # [改进] 关系特征处理层 - 更大的网络
-        self.rel_fc = nn.Sequential(
-            nn.Linear(1000, attr_dim * 4),
-            nn.LayerNorm(attr_dim * 4),
+        # [改进] 关系特征处理层 - 更深的网络，支持增强关系特征
+        # 自动检测输入维度(基础1000 或 增强2004)
+        self.rel_input_dim = 1000  # 将在forward中动态调整
+        
+        # 使用可变输入维度的深层网络
+        self.rel_fc_input = None  # 延迟初始化
+        self.rel_fc_core = nn.Sequential(
+            nn.Linear(attr_dim * 8, attr_dim * 6),
+            nn.BatchNorm1d(attr_dim * 6),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(attr_dim * 6, attr_dim * 4),
+            nn.BatchNorm1d(attr_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(attr_dim * 4, attr_dim * 2),
-            nn.LayerNorm(attr_dim * 2),
+            nn.BatchNorm1d(attr_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(attr_dim * 2, attr_dim)
         )
+        # 残差投影
+        self.rel_skip = None  # 延迟初始化
         
         self.att_fc = nn.Sequential(
             nn.Linear(1000, attr_dim * 2),
@@ -981,7 +1000,25 @@ class IBMultiModal(nn.Module):
         rel_emb = None
         if self.args.w_rel and rel_features is not None:
             try:
-                rel_emb = self.rel_fc(rel_features)
+                # 动态初始化输入层(支持1000维或2004维)
+                rel_input_dim = rel_features.size(-1)
+                if self.rel_fc_input is None or self.rel_fc_input[0].in_features != rel_input_dim:
+                    self.rel_fc_input = nn.Sequential(
+                        nn.Linear(rel_input_dim, self.args.attr_dim * 8),
+                        nn.BatchNorm1d(self.args.attr_dim * 8),
+                        nn.ReLU(),
+                        nn.Dropout(self.args.dropout * 0.5)
+                    ).to(rel_features.device)
+                    # 残差投影
+                    self.rel_skip = nn.Linear(rel_input_dim, self.args.attr_dim).to(rel_features.device)
+                
+                # 前向传播
+                rel_h = self.rel_fc_input(rel_features)
+                rel_emb = self.rel_fc_core(rel_h)
+                
+                # 残差连接
+                if self.rel_skip is not None:
+                    rel_emb = rel_emb + 0.1 * self.rel_skip(rel_features)
                 
                 if self.use_rel_vib and hasattr(self, 'rel_fc_mu'):
                     rel_emb_h = F.relu(rel_emb)

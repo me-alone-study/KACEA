@@ -24,7 +24,7 @@ except:
 
 
 class MsLoss(nn.Module):
-    def __init__(self, device, thresh=0.5, scale_pos=0.1, scale_neg=40.0):
+    def __init__(self, device, thresh=0.5, scale_pos=0.05, scale_neg=50.0):
         super(MsLoss, self).__init__()
         self.device = device
         alpha, beta, base = scale_pos, scale_neg, thresh
@@ -70,15 +70,15 @@ class InfoNCE_loss(nn.Module):
 class HardNegativeInfoNCE(nn.Module):
     """
     带硬负样本挖掘的InfoNCE损失 - 改进版
-    [改进] 增大margin从0.3到0.5，增强负样本区分能力
+    [改进] 增大margin从0.3到0.8，增强负样本区分能力
     """
     
-    def __init__(self, device, temperature=0.05, hard_negative_weight=0.5, margin=0.5):
+    def __init__(self, device, temperature=0.05, hard_negative_weight=0.8, margin=0.8):
         super().__init__()
         self.device = device
         self.temperature = temperature
         self.hard_negative_weight = hard_negative_weight
-        self.margin = margin  # [改进] 从0.3增加到0.5
+        self.margin = margin  # [改进] 从0.3增加到0.8
         self.ce_loss = nn.CrossEntropyLoss()
     
     def forward(self, emb, train_links):
@@ -466,18 +466,18 @@ class ImprovedComprehensiveLoss(nn.Module):
         self.args = args
         self.device = device
         
-        # [改进] 增大margin
+        # [改进] 增大margin和hard_negative_weight
         self.hard_nce = HardNegativeInfoNCE(
             device, 
             temperature=args.tau,
-            hard_negative_weight=getattr(args, 'hard_negative_weight', 0.5),
-            margin=getattr(args, 'triplet_margin', 0.5)  # [改进] 默认0.5
+            hard_negative_weight=getattr(args, 'hard_negative_weight', 0.8),
+            margin=getattr(args, 'triplet_margin', 0.8)  # [改进] 默认0.8
         )
         self.ms_loss = MsLoss(
             device, 
             thresh=getattr(args, 'ms_base', 0.5),
-            scale_pos=getattr(args, 'ms_alpha', 0.1), 
-            scale_neg=getattr(args, 'ms_beta', 40.0)
+            scale_pos=getattr(args, 'ms_alpha', 0.05), 
+            scale_neg=getattr(args, 'ms_beta', 50.0)
         )
         
         # 跨模态一致性损失
